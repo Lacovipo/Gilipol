@@ -106,14 +106,14 @@ int opt_bus_nm_div =                197;
 int opt_bus_nm_verif =              8;
 
 // LMR
-int opt_lmr_base_depth =            3;
-int opt_lmr_base_move =             3;
-int opt_lmr_check_depth =           -1;
-int opt_lmr_cut_depth =             2;
-int opt_lmr_mejo_depth =            0;
+int opt_lmr_base_depth =            2;
+int opt_lmr_base_move =             4;
+int opt_lmr_check_depth =           -3;
+int opt_lmr_cut_depth =             3;
+int opt_lmr_mejo_depth =            -3;
 int opt_lmr_goodmove_margin =       230;
-int opt_lmr_eval_depth =            1;
-int opt_lmr_ttd_depth =             0;
+int opt_lmr_eval_depth =            4;
+int opt_lmr_ttd_depth =             -1;
 int opt_lmr_ttcapt_depth =          1;
 int opt_lmr_hist_menos2 =           7974;
 int opt_lmr_hist_menos1 =           3424;
@@ -931,7 +931,7 @@ int main()
 
         if (strcmp(command, "uci") == 0)
         {
-            printf("id name Gilipol 1.00\n");
+            printf("id name Gilipol 1.01 LMR base 3\n");
             printf("id author Jose Carlos Martinez Galan\n");
             printf("option name Hash type spin default 32 min 1 max 1024\n");
             #ifdef USE_SMP
@@ -1005,7 +1005,7 @@ int main()
             #endif
 
             #if (OPTIMIZAR_FP)
-                printf("option name BusFutDepth type spin default %d min 1 max 10\n", opt_bus_fut_depth);
+7                printf("option name BusFutDepth type spin default %d min 1 max 10\n", opt_bus_fut_depth);
                 printf("option name BusFutBase type spin default %d min 0 max 500\n", opt_bus_fut_base);
                 printf("option name BusFutMargin type spin default %d min 0 max 200\n", opt_bus_fut_margin);
             #endif
@@ -1034,18 +1034,18 @@ int main()
             #if (OPTIMIZAR_LMR)
                 printf("option name LMRBaseDepth type spin default %d min 1 max 4\n", opt_lmr_base_depth);
                 printf("option name LMRBaseMove type spin default %d min 2 max 4\n", opt_lmr_base_move);
-                printf("option name LMRCheckDepth type spin default %d min -2 max 0\n", opt_lmr_check_depth);
-                printf("option name LMRCutDepth type spin default %d min 0 max 2\n", opt_lmr_cut_depth);
-                printf("option name LMRMejoDepth type spin default %d min -1 max 0\n", opt_lmr_mejo_depth);
+                printf("option name LMRCheckDepth type spin default %d min -6 max 0\n", opt_lmr_check_depth);
+                printf("option name LMRCutDepth type spin default %d min 0 max 6\n", opt_lmr_cut_depth);
+                printf("option name LMRMejoDepth type spin default %d min -6 max 0\n", opt_lmr_mejo_depth);
                 printf("option name LMRGoodMoveMargin type spin default %d min 100 max 300\n", opt_lmr_goodmove_margin);
-                printf("option name LMREvalDepth type spin default %d min 0 max 1\n", opt_lmr_eval_depth);
-                printf("option name LMRTTDDepth type spin default %d min -1 max 0\n", opt_lmr_ttd_depth);
-                printf("option name LMRTTCaptDepth type spin default %d min 0 max 1\n", opt_lmr_ttcapt_depth);
-                printf("option name LMRHistMenos2 type spin default %d min 5001 max 12000\n", opt_lmr_hist_menos2);
-                printf("option name LMRHistMenos1 type spin default %d min 1000 max 5000\n", opt_lmr_hist_menos1);
-                printf("option name LMRHistMas1 type spin default %d min -6000 max 0\n", opt_lmr_hist_mas1);
-                printf("option name LMRCHistMas1 type spin default %d min -600 max 0\n", opt_lmr_chist_mas1);
-                printf("option name LMRCHistMenos1 type spin default %d min 0 max 600\n", opt_lmr_chist_menos1);
+                printf("option name LMREvalDepth type spin default %d min 0 max 6\n", opt_lmr_eval_depth);
+                printf("option name LMRTTDDepth type spin default %d min -6 max 0\n", opt_lmr_ttd_depth);
+                printf("option name LMRTTCaptDepth type spin default %d min 0 max 6\n", opt_lmr_ttcapt_depth);
+                printf("option name LMRHistMenos2 type spin default %d min 6000 max 10000\n", opt_lmr_hist_menos2);
+                printf("option name LMRHistMenos1 type spin default %d min 2500 max 4500\n", opt_lmr_hist_menos1);
+                printf("option name LMRHistMas1 type spin default %d min -3500 max -1500\n", opt_lmr_hist_mas1);
+                printf("option name LMRCHistMas1 type spin default %d min -400 max -100\n", opt_lmr_chist_mas1);
+                printf("option name LMRCHistMenos1 type spin default %d min 0 max 300\n", opt_lmr_chist_menos1);
             #endif
 
             #if (OPTIMIZAR_PBCT)

@@ -1493,7 +1493,7 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
         else
         {
             //
-            // Reducciones
+            // Reducciones (LMR)
             //
             int reduction = 0;
             if (depth >= LMR_BASE_DEPTH
@@ -1527,11 +1527,11 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
                         hist_score += ATOMIC_LOAD(continuation_history[prev_info_lmr.piece][prev_info_lmr.to][source][target]) / 2;
 
                     if (hist_score >= LMR_HIST_MENOS2)
-                        reduction -= 2;
+                        reduction -= 6; // 2 * 3
                     else if (hist_score >= LMR_HIST_MENOS1)
-                        reduction -= 1;
+                        reduction -= 3; // 1 * 3
                     else if (hist_score <= LMR_HIST_MAS1 && legal_moves >= LMR_BASE_MOVE + 6)
-                        reduction += 1;
+                        reduction += 3; // 1 * 3
                 }
 
                 // Ajuste por Capture History: capturas con SEE < 0 que entran en LMR
@@ -1551,9 +1551,9 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
                         int capt_hist = sd->capture_history[side * 6 + attacker][target][victim];
 
                         if (capt_hist <= LMR_CHIST_MAS1)
-                            reduction += 1;
+                            reduction += 3; // 1 * 3
                         else if (capt_hist >= LMR_CHIST_MENOS1)
-                            reduction -= 1;
+                            reduction -= 3; // 1 * 3
                     }
                 }
 
@@ -1573,10 +1573,8 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
                     reduction = (reduction * scale_factor) / 2;
                 }
 
-                // OJO: para cuando implemente reducciones base 3 (sólo me quedaría multiplicar las constantes por 3 y definir márgenes de opciones UCI)
-                #if (0)
+                // Las reducciones que aplicamos son tercios de ply; si reducimos 6, es una reducción de 6/3 = 2
                 reduction = RedondeoSimetricoBase3(reduction);
-                #endif
 
                 // Reducción base logarítmica
                 reduction += (lmr_red(legal_moves) + lmr_red(depth)) / 2;
@@ -1888,6 +1886,98 @@ void search_position(Position* pos, SearchLimits limits)
     // Incrementar generación de TT (aging automático)
     tt_new_search();
 
+    // --- Syzygy Root Probe (Solución a Ceguera de WDL / Shuffling) ---
+    int pieces = count_bits(pos->all);
+    if (pieces <= opt_syzygy_probe_limit && (unsigned)pieces <= TB_LARGEST)
+    {
+        int castling = pos->castling_rights;
+        int ep = (pos->en_passant_sq == SQ_NONE) ? 0 : pos->en_passant_sq;
+        
+        unsigned tb_res = tb_probe_root(
+            pos->occupied[WHITE], pos->occupied[BLACK],
+            pos->pieces[WHITE][KING] | pos->pieces[BLACK][KING],
+            pos->pieces[WHITE][QUEEN] | pos->pieces[BLACK][QUEEN],
+            pos->pieces[WHITE][ROOK] | pos->pieces[BLACK][ROOK],
+            pos->pieces[WHITE][BISHOP] | pos->pieces[BLACK][BISHOP],
+            pos->pieces[WHITE][KNIGHT] | pos->pieces[BLACK][KNIGHT],
+            pos->pieces[WHITE][PAWN] | pos->pieces[BLACK][PAWN],
+            opt_syzygy_50move_rule ? pos->half_move_clock : 0,
+            castling, ep, pos->side_to_move == WHITE,
+            NULL
+        );
+
+        // Verificamos si las bases nos devuelven un movimiento válido.
+        if (tb_res != TB_RESULT_FAILED && tb_res != TB_RESULT_CHECKMATE && tb_res != TB_RESULT_STALEMATE)
+        {
+            int from = TB_GET_FROM(tb_res);
+            int to = TB_GET_TO(tb_res);
+            int promotes_tb = TB_GET_PROMOTES(tb_res);
+            
+            int promoted = 0;
+            switch (promotes_tb)
+            {
+                case TB_PROMOTES_QUEEN: promoted = QUEEN; break;
+                case TB_PROMOTES_ROOK: promoted = ROOK; break;
+                case TB_PROMOTES_BISHOP: promoted = BISHOP; break;
+                case TB_PROMOTES_KNIGHT: promoted = KNIGHT; break;
+            }
+
+            // Validamos contra nuestro generador para asegurar legalidad absoluta en nuestra estructura
+            MoveList root_moves;
+            generate_moves(pos, &root_moves, GEN_ALL);
+            Move tb_move = MOVE_NONE;
+            for (int i = 0; i < root_moves.count; i++)
+            {
+                Move m = root_moves.moves[i];
+                if (GET_MOVE_SOURCE(m) == from
+                    && GET_MOVE_TARGET(m) == to
+                    && GET_MOVE_PROMOTED(m) == promoted)
+                {
+                    Position test_pos;
+                    copy_position(&test_pos, pos);
+                    if (make_move(&test_pos, m))
+                    {
+                        tb_move = m;
+                        break;
+                    }
+                }
+            }
+
+            if (tb_move != MOVE_NONE)
+            {
+                int wdl = TB_GET_WDL(tb_res);
+                int dtz = TB_GET_DTZ(tb_res);
+                
+                int score = 0;
+                if (wdl == TB_WIN)
+                    score = TB_MAX - dtz;
+                else if (wdl == TB_LOSS)
+                    score = -TB_MAX + dtz;
+                else if (wdl == TB_DRAW)
+                    score = 0;
+                else if (wdl == TB_CURSED_WIN)
+                    score = opt_syzygy_50move_rule ? 0 : (TB_MAX - dtz);
+                else if (wdl == TB_BLESSED_LOSS)
+                    score = opt_syzygy_50move_rule ? 0 : (-TB_MAX + dtz);
+
+                printf("info depth 1 score ");
+                print_score(score);
+                printf(" time 0 nodes 0 pv ");
+                print_move(tb_move);
+                printf("\n");
+                
+                printf("bestmove ");
+                print_move(tb_move);
+                printf("\n");
+                fflush(stdout);
+
+                // Retornar inmediatamente evita que inicie toda la búsqueda Iterativa 
+                // y los hilos en Lazy SMP de forma innecesaria.
+                return;
+            }
+        }
+    }
+
     // Configurar datos del hilo principal (ID 0)
     SearchData main_sd;
     main_sd.thread_id = 0;
@@ -1913,7 +2003,8 @@ void search_position(Position* pos, SearchLimits limits)
     if (num_helpers > 0)
     {
         helper_data = (SearchData*)malloc(num_helpers * sizeof(SearchData));
-        if (!helper_data) {
+        if (!helper_data)
+        {
             printf("info string Error: Failed to allocate memory for helper data\n");
             num_helpers = 0;
         }
@@ -1927,7 +2018,8 @@ void search_position(Position* pos, SearchLimits limits)
         helper_threads = (pthread_t*)malloc(num_helpers * sizeof(pthread_t));
 #endif
 
-        if (!helper_threads) {
+        if (!helper_threads)
+        {
             printf("info string Error: Failed to allocate memory for helper threads\n");
             free(helper_data);
             num_helpers = 0;
@@ -1940,14 +2032,16 @@ void search_position(Position* pos, SearchLimits limits)
 
 #ifdef _WIN32
             helper_threads[i] = CreateThread(NULL, 0, search_worker, &helper_data[i], 0, NULL);
-            if (helper_threads[i] == NULL) {
+            if (helper_threads[i] == NULL)
+            {
                 printf("info string Error: Failed to create thread %d\n", i+1);
                 // Stop creating threads, but keep the ones created
                 num_helpers = i;
                 break;
             }
 #else
-            if (pthread_create(&helper_threads[i], NULL, search_worker, &helper_data[i]) != 0) {
+            if (pthread_create(&helper_threads[i], NULL, search_worker, &helper_data[i]) != 0)
+            {
                 printf("info string Error: Failed to create thread %d\n", i+1);
                 num_helpers = i;
                 break;
@@ -2063,7 +2157,8 @@ void search_position(Position* pos, SearchLimits limits)
                     long long current_time = get_time_ms();
                     long long total_nodes_fl = ATOMIC_LOAD(main_sd.nodes);
 #ifdef USE_SMP
-                    if (helper_data) {
+                    if (helper_data)
+                    {
                         for (int i = 0; i < num_helpers; i++)
                             total_nodes_fl += ATOMIC_LOAD(helper_data[i].nodes);
                     }
@@ -2169,7 +2264,8 @@ void search_position(Position* pos, SearchLimits limits)
                 // Calcular nodos totales (Main + Helpers)
                 long long total_nodes = ATOMIC_LOAD(main_sd.nodes);
 #ifdef USE_SMP
-                if (helper_data) {
+                if (helper_data)
+                {
                     for (int i = 0; i < num_helpers; i++)
                         total_nodes += ATOMIC_LOAD(helper_data[i].nodes);
                 }
@@ -2227,11 +2323,12 @@ void search_position(Position* pos, SearchLimits limits)
                 double stability_factor = 1.0;
 
                 // Node TM: Ajustar según fracción de nodos del mejor movimiento
-                if (root_total_nodes > 0 && current_depth >= 10)
+                if (root_total_nodes > 0 && current_depth >= 8)
                 {
                     double best_fraction = (double)root_best_move_nodes / (double)root_total_nodes;
-                    double node_factor = 1.8 - 1.2 * best_fraction;
-                    node_factor = clamp_double(node_factor, 0.6, 1.8);
+                    // Aumentar tiempo si hay dudas (<50%), reducir solo si es muy obvia (>80%)
+                    double node_factor = 1.5 - best_fraction;
+                    node_factor = clamp_double(node_factor, 0.5, 1.5);
                     stability_factor *= node_factor;
                 }
 
@@ -2267,19 +2364,18 @@ void search_position(Position* pos, SearchLimits limits)
                         stability_factor *= 0.5;
 
                     // Ajuste por evaluación
-                    if (current_depth >= 10 && abs(score) < MATE_BOUND)
+                    if (current_depth >= 8 && abs(score) < MATE_BOUND)
                     {
                         double score_factor = 1.0;
-                        if (score > 0)
-                            score_factor = 1.0 - (double)score / 1200.0; // En +300 da 0.75
-                        else
-                            score_factor = 1.0 - (double)score / 400.0;  // En -100 da 1.25, en -200 da 1.50
+                        // Solo reducir tiempo si la ventaja es clara y sólida
+                        if (score > 200)
+                            score_factor = 1.0 - (double)(score - 200) / 1000.0;
+                        // Si estamos perdiendo o en apuros (< -0.50), usar más tiempo para defender
+                        else if (score < -50)
+                            score_factor = 1.0 - (double)(score + 50) / 400.0;
                             
                         // Acotar a márgenes de seguridad para evitar locuras con scores extremos
-                        if (score_factor < 0.75)
-                            score_factor = 0.75;
-                        if (score_factor > 1.50)
-                            score_factor = 1.50;
+                        score_factor = clamp_double(score_factor, 0.70, 1.50);
                         
                         stability_factor *= score_factor;
                     }
@@ -2288,7 +2384,7 @@ void search_position(Position* pos, SearchLimits limits)
                     if (current_depth >= 10 && stability_count >= 3 && best_move != MOVE_NONE)
                     {
                         int capped = stability_count < 10 ? stability_count : 10;
-                        stability_factor *= 1.0 - 0.01 * capped;
+                        stability_factor *= 1.0 - 0.015 * capped;
                     }
                 }
 
@@ -2353,8 +2449,6 @@ void search_position(Position* pos, SearchLimits limits)
 
                 // Predicción de Branching Factor (fallback simple)
                 // Solo usamos el fallback si no tenemos datos fiables para la predicción
-                // JC: creo que es un error comparar con el tiempo hard; hay que comparar con current_soft
-                //if (!prediction_success && time_used * 2 > hard_limit)
                 if (!prediction_success && 3 * time_used / 2 > current_soft)
                 {
                     ATOMIC_STORE(stop_search, 1);
@@ -2385,15 +2479,18 @@ void search_position(Position* pos, SearchLimits limits)
         // WaitForMultipleObjects limit 64
         int count = num_helpers;
         int index = 0;
-        while (count > 0) {
+        while (count > 0)
+        {
             int chunk = (count > 64) ? 64 : count;
             WaitForMultipleObjects(chunk, &helper_threads[index], TRUE, INFINITE);
             index += chunk;
             count -= chunk;
         }
-        for (int i = 0; i < num_helpers; i++) CloseHandle(helper_threads[i]);
+        for (int i = 0; i < num_helpers; i++)
+            CloseHandle(helper_threads[i]);
 #else
-        for (int i = 0; i < num_helpers; i++) pthread_join(helper_threads[i], NULL);
+        for (int i = 0; i < num_helpers; i++)
+            pthread_join(helper_threads[i], NULL);
 #endif
         free(helper_data);
         free(helper_threads);

@@ -603,14 +603,14 @@ long long get_time_ms();
     #define LMR_CHIST_MAS1              opt_lmr_chist_mas1
     #define LMR_CHIST_MENOS1            opt_lmr_chist_menos1
 #else
-    #define LMR_BASE_DEPTH              3
-    #define LMR_BASE_MOVE               3
-    #define LMR_CHECK_DEPTH             -1
-    #define LMR_CUT_DEPTH               2
-    #define LMR_MEJO_DEPTH              0
+    #define LMR_BASE_DEPTH              2
+    #define LMR_BASE_MOVE               4
+    #define LMR_CHECK_DEPTH             -3
+    #define LMR_CUT_DEPTH               3
+    #define LMR_MEJO_DEPTH              -3
     #define LMR_GOODMOVE_MARGIN         230
-    #define LMR_EVAL_DEPTH              1
-    #define LMR_TTD_DEPTH               0
+    #define LMR_EVAL_DEPTH              4
+    #define LMR_TTD_DEPTH               -1
     #define LMR_TTCAPT_DEPTH            1
     #define LMR_HIST_MENOS2             7974
     #define LMR_HIST_MENOS1             3424
