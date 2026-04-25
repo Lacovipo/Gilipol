@@ -469,8 +469,8 @@ long long get_time_ms();
     #define BUS_RAZOR_MARGIN3           315 // 11/04/26
     #define BUS_RAZOR_MARGIN4           500 // 12/04/26
     #define BUS_RAZOR_MARGIN5           700
-    #define BUS_FULLRAZ_BASE            500
-    #define BUS_FULLRAZ_MULT            350
+    #define BUS_FULLRAZ_BASE            350
+    #define BUS_FULLRAZ_MULT            260
 #endif
 
 #if (OPTIMIZAR_PODAJC)

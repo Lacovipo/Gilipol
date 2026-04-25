@@ -1064,13 +1064,11 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
     // Full razoring (por llamarlo de alguna forma)
     // Idea vista en SF y algún otro (Halogen, Reckless...)
     //
-    #if (0)
     if (bPodable
         && static_eval < alpha - BUS_FULLRAZ_BASE - BUS_FULLRAZ_MULT * depth * depth)
     {
         return quiescence(pos, alpha, beta, ply, sd);
     }
-    #endif
 
 	//
 	// Razoring contra alfa (si estamos tan lejos de alfa que únicamente podemos recuperar con capturas, intentamos llegar a alfa con quiesce)
