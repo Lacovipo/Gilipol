@@ -2351,39 +2351,36 @@ void search_position(Position* pos, SearchLimits limits)
                 if (fail_highs > 0)
                     stability_factor *= 1.0 + 0.01 * fail_highs;
 
-                // Reducciones de tiempo (solo si no es movetime fijo)
-                if (limits.movetime == 0)
+                // Reducciones de tiempo
+                if (fail_lows + fail_highs >= MAX_ASPIRATION_FAILS)
+                    stability_factor *= 0.8;
+
+                // Si es mate inminente o final resuelto por tablebases, no gastar tiempo
+                if (abs(score) >= TB_MAX - MAX_PLY)
+                    stability_factor *= 0.5;
+
+                // Ajuste por evaluación
+                if (current_depth >= 8 && abs(score) < MATE_BOUND)
                 {
-                    if (fail_lows + fail_highs >= MAX_ASPIRATION_FAILS)
-                        stability_factor *= 0.8;
-
-                    // Si es mate inminente o final resuelto por tablebases, no gastar tiempo
-                    if (abs(score) >= TB_MAX - MAX_PLY)
-                        stability_factor *= 0.5;
-
-                    // Ajuste por evaluación
-                    if (current_depth >= 8 && abs(score) < MATE_BOUND)
-                    {
-                        double score_factor = 1.0;
-                        // Solo reducir tiempo si la ventaja es clara y sólida
-                        if (score > 200)
-                            score_factor = 1.0 - (double)(score - 200) / 1000.0;
-                        // Si estamos perdiendo o en apuros (< -0.50), usar más tiempo para defender
-                        else if (score < -50)
-                            score_factor = 1.0 - (double)(score + 50) / 400.0;
-                            
-                        // Acotar a márgenes de seguridad para evitar locuras con scores extremos
-                        score_factor = clamp_double(score_factor, 0.70, 1.50);
+                    double score_factor = 1.0;
+                    // Solo reducir tiempo si la ventaja es clara y sólida
+                    if (score > 200 && current_depth >= 14)
+                        score_factor = 1.0 - (double)(score - 200) / 1000.0;
+                    // Si estamos perdiendo o en apuros (< -0.50), usar más tiempo para defender
+                    else if (score < -50)
+                        score_factor = 1.0 - (double)(score + 50) / 400.0;
                         
-                        stability_factor *= score_factor;
-                    }
+                    // Acotar a márgenes de seguridad para evitar locuras con scores extremos
+                    score_factor = clamp_double(score_factor, 0.70, 1.50);
+                    
+                    stability_factor *= score_factor;
+                }
 
-                    // Estabilidad continua: cuanto más tiempo lleva el best move sin cambiar, más reducimos.
-                    if (current_depth >= 10 && stability_count >= 3 && best_move != MOVE_NONE)
-                    {
-                        int capped = stability_count < 10 ? stability_count : 10;
-                        stability_factor *= 1.0 - 0.015 * capped;
-                    }
+                // Estabilidad continua: cuanto más tiempo lleva el best move sin cambiar, más reducimos.
+                if (current_depth >= 14 && stability_count >= 4 && best_move != MOVE_NONE)
+                {
+                    int capped = stability_count < 10 ? stability_count : 10;
+                    stability_factor *= 1.0 - 0.015 * capped;
                 }
 
                 // Limitar stability_factor para evitar exceder hard limit
@@ -2437,7 +2434,10 @@ void search_position(Position* pos, SearchLimits limits)
                         prev_growth_count++;
 
                     long long predicted_next = (long long)(current_iter_time * growth);
-                    if (time_used + predicted_next > current_soft)
+                    
+                    // Idea de 1/4: solo abortar si el tiempo restante no nos da
+                    // ni para hacer el 25% de la siguiente iteración.
+                    if (time_used + (predicted_next / 4) > current_soft)
                     {
                         ATOMIC_STORE(stop_search, 1);
                         break;
@@ -2445,9 +2445,8 @@ void search_position(Position* pos, SearchLimits limits)
                     prediction_success = true;
                 }
 
-                // Predicción de Branching Factor (fallback simple)
-                // Solo usamos el fallback si no tenemos datos fiables para la predicción
-                if (!prediction_success && 3 * time_used / 2 > current_soft)
+                // Fallback si no hay predicción fiable (asume growth empírico de ~2.0 y aplica la misma regla de 1/4)
+                if (!prediction_success && time_used + (time_used / 2) > current_soft)
                 {
                     ATOMIC_STORE(stop_search, 1);
                     break;

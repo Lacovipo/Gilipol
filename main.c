@@ -931,7 +931,7 @@ int main()
 
         if (strcmp(command, "uci") == 0)
         {
-            printf("id name Gilipol 1.02 Full Razoring\n");
+            printf("id name Gilipol 1.03 Time management\n");
             printf("id author Jose Carlos Martinez Galan\n");
             printf("option name Hash type spin default 32 min 1 max 1024\n");
             #ifdef USE_SMP
