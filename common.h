@@ -208,6 +208,7 @@ void tt_new_search();  // Llamar al inicio de cada búsqueda (incrementa generac
 #define MAX_GAME_HISTORY 1024
 
 extern ATOMIC_INT stop_search;
+extern ATOMIC_INT is_searching;
 extern uint64_t game_history[MAX_GAME_HISTORY];
 extern int game_history_count;
 extern int opt_threads;
@@ -422,7 +423,7 @@ long long get_time_ms();
 // Parámetros de búsqueda
 //
 
-#define OPTIMIZAR_QS        0
+#define OPTIMIZAR_QS        1
 #define OPTIMIZAR_RAZOR     0   // Razoring normal y Full Razoring
 #define OPTIMIZAR_PODAJC    0
 #define OPTIMIZAR_SEEP      0   // SEE Pruning (with history)
@@ -460,6 +461,7 @@ long long get_time_ms();
     #define BUS_RAZOR_MARGIN3           opt_bus_razor_margin3
     #define BUS_RAZOR_MARGIN4           opt_bus_razor_margin4
     #define BUS_RAZOR_MARGIN5           opt_bus_razor_margin5
+    #define BUS_FULLRAZ_USE             0
     #define BUS_FULLRAZ_BASE            opt_bus_fullraz_base
     #define BUS_FULLRAZ_MULT            opt_bus_fullraz_mult
 #else
@@ -469,6 +471,7 @@ long long get_time_ms();
     #define BUS_RAZOR_MARGIN3           315 // 11/04/26
     #define BUS_RAZOR_MARGIN4           500 // 12/04/26
     #define BUS_RAZOR_MARGIN5           700
+    #define BUS_FULLRAZ_USE             0
     #define BUS_FULLRAZ_BASE            350
     #define BUS_FULLRAZ_MULT            260
 #endif

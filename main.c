@@ -16,11 +16,13 @@
 #include <sys/time.h>
 #include <pthread.h>
 #include <strings.h>
+#include <unistd.h>
 #define STRCASECMP strcasecmp
 #endif
 
 Position g_pos;                 // Instancia global del tablero
 ATOMIC_INT stop_search = 0;     // Variable global para detener la búsqueda
+ATOMIC_INT is_searching = 0;    // Variable para saber si hay una búsqueda activa
 
 // opciones generales
 int opt_threads = 1;
@@ -30,7 +32,7 @@ char opt_syzygy_path[1024] = "";
 int opt_syzygy_probe_limit = 7;
 int opt_syzygy_probe_depth = 1;
 int opt_syzygy_50move_rule = 1;
-char opt_nnue_path[1024] = "net4.bin";
+char opt_nnue_path[1024] = "net5.bin";
 
 // QS
 int opt_qs_poda_delta =             98;
@@ -290,7 +292,22 @@ void* search_thread(void* lpParam)
  */
 void engine_go(SearchLimits limits)
 {
+    // Si ya hay una búsqueda activa (la GUI interrumpe sin un stop previo), pedimos parar.
+    if (ATOMIC_LOAD(is_searching))
+        ATOMIC_STORE(stop_search, 1);
+
+    // Esperar a que la búsqueda anterior termine completamente y de forma segura
+    while (ATOMIC_LOAD(is_searching))
+    {
+#ifdef _WIN32
+        Sleep(1);
+#else
+        usleep(1000);
+#endif
+    }
+
     ATOMIC_STORE(stop_search, 0);
+    ATOMIC_STORE(is_searching, 1);
 
     // Crear una copia de los límites para pasar al hilo
     SearchLimits* limits_ptr = malloc(sizeof(SearchLimits));
@@ -300,10 +317,14 @@ void engine_go(SearchLimits limits)
     HANDLE hThread = CreateThread(NULL, 0, search_thread, limits_ptr, 0, NULL);
     if (hThread != NULL)
         CloseHandle(hThread); // Cerrar handle inmediatamente para evitar leak
+    else
+        ATOMIC_STORE(is_searching, 0); // Si falla la creación, reseteamos bandera
 #else
     pthread_t thread_id;
-    pthread_create(&thread_id, NULL, search_thread, limits_ptr);
-    pthread_detach(thread_id); // Detach para liberar recursos automáticamente
+    if (pthread_create(&thread_id, NULL, search_thread, limits_ptr) == 0)
+        pthread_detach(thread_id); // Detach para liberar recursos automáticamente
+    else
+        ATOMIC_STORE(is_searching, 0); // Si falla la creación, reseteamos bandera
 #endif
 }
 
@@ -931,7 +952,7 @@ int main()
 
         if (strcmp(command, "uci") == 0)
         {
-            printf("id name Gilipol 1.03 Time management\n");
+            printf("id name Gilipol 2.00\n");
             printf("id author Jose Carlos Martinez Galan\n");
             printf("option name Hash type spin default 32 min 1 max 1024\n");
             #ifdef USE_SMP

@@ -1064,7 +1064,8 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
     // Full razoring (por llamarlo de alguna forma)
     // Idea vista en SF y algún otro (Halogen, Reckless...)
     //
-    if (bPodable
+    if (BUS_FULLRAZ_USE
+        && bPodable
         && static_eval < alpha - BUS_FULLRAZ_BASE - BUS_FULLRAZ_MULT * depth * depth)
     {
         return quiescence(pos, alpha, beta, ply, sd);
@@ -1971,6 +1972,7 @@ void search_position(Position* pos, SearchLimits limits)
 
                 // Retornar inmediatamente evita que inicie toda la búsqueda Iterativa 
                 // y los hilos en Lazy SMP de forma innecesaria.
+                ATOMIC_STORE(is_searching, 0);
                 return;
             }
         }
@@ -2324,8 +2326,13 @@ void search_position(Position* pos, SearchLimits limits)
                 if (root_total_nodes > 0 && current_depth >= 8)
                 {
                     double best_fraction = (double)root_best_move_nodes / (double)root_total_nodes;
-                    // Aumentar tiempo si hay dudas (<50%), reducir solo si es muy obvia (>80%)
-                    double node_factor = 1.5 - best_fraction;
+                    // Aumentar tiempo si hay dudas (<50%), reducir solo si es muy obvia (>90%)
+                    double node_factor = 1.0;
+                    if (best_fraction < 0.5)
+                        node_factor = 1.5 - best_fraction; // Escala de 1.0 a 1.5
+                    else if (best_fraction > 0.9)
+                        node_factor = 1.0 - (best_fraction - 0.9) * 2.0; // Escala de 1.0 a 0.8
+
                     node_factor = clamp_double(node_factor, 0.5, 1.5);
                     stability_factor *= node_factor;
                 }
@@ -2353,7 +2360,7 @@ void search_position(Position* pos, SearchLimits limits)
 
                 // Reducciones de tiempo
                 if (fail_lows + fail_highs >= MAX_ASPIRATION_FAILS)
-                    stability_factor *= 0.8;
+                    stability_factor *= 0.9;
 
                 // Si es mate inminente o final resuelto por tablebases, no gastar tiempo
                 if (abs(score) >= TB_MAX - MAX_PLY)
@@ -2377,7 +2384,7 @@ void search_position(Position* pos, SearchLimits limits)
                 }
 
                 // Estabilidad continua: cuanto más tiempo lleva el best move sin cambiar, más reducimos.
-                if (current_depth >= 14 && stability_count >= 4 && best_move != MOVE_NONE)
+                if (current_depth >= 14 && stability_count >= 6 && best_move != MOVE_NONE)
                 {
                     int capped = stability_count < 10 ? stability_count : 10;
                     stability_factor *= 1.0 - 0.015 * capped;
@@ -2551,6 +2558,8 @@ void search_position(Position* pos, SearchLimits limits)
         printf("0000\n"); // No move (mate o ahogado - posición terminal)
     }
     fflush(stdout);
+
+    ATOMIC_STORE(is_searching, 0);
 }
 
 void engine_ponderhit()

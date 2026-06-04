@@ -241,26 +241,46 @@ static void calculate_tactical_features(const Position* pos, int* features, int*
     // --- 5. Jaque Burro (782-783) ---
     if (b_king != -1)
     {
-        Bitboard target_sqs = get_knight_attacks(b_king) & ~black_attacks & ~pos->occupied[WHITE];
-        Bitboard w_knight_attacks = 0;
+        Bitboard black_majors = pos->pieces[BLACK][QUEEN] | pos->pieces[BLACK][ROOK];
+        Bitboard candidate_sqs = get_knight_attacks(b_king) & ~black_attacks & ~pos->occupied[WHITE];
         Bitboard n = pos->pieces[WHITE][KNIGHT];
         while (n)
-            w_knight_attacks |= get_knight_attacks(pop_lsb(&n));
-        
-        if (target_sqs & w_knight_attacks)
-            features[(*count)++] = 782;
+        {
+            int knight_sq = pop_lsb(&n);
+            Bitboard reachable = get_knight_attacks(knight_sq) & candidate_sqs;
+            while (reachable)
+            {
+                int dest = pop_lsb(&reachable);
+                if (get_knight_attacks(dest) & black_majors)
+                {
+                    features[(*count)++] = 782;
+                    goto done_782;
+                }
+            }
+        }
+        done_782:;
     }
-    
+
     if (w_king != -1)
     {
-        Bitboard target_sqs = get_knight_attacks(w_king) & ~white_attacks & ~pos->occupied[BLACK];
-        Bitboard b_knight_attacks = 0;
+        Bitboard white_majors = pos->pieces[WHITE][QUEEN] | pos->pieces[WHITE][ROOK];
+        Bitboard candidate_sqs = get_knight_attacks(w_king) & ~white_attacks & ~pos->occupied[BLACK];
         Bitboard n = pos->pieces[BLACK][KNIGHT];
         while (n)
-            b_knight_attacks |= get_knight_attacks(pop_lsb(&n));
-        
-        if (target_sqs & b_knight_attacks)
-            features[(*count)++] = 783;
+        {
+            int knight_sq = pop_lsb(&n);
+            Bitboard reachable = get_knight_attacks(knight_sq) & candidate_sqs;
+            while (reachable)
+            {
+                int dest = pop_lsb(&reachable);
+                if (get_knight_attacks(dest) & white_majors)
+                {
+                    features[(*count)++] = 783;
+                    goto done_783;
+                }
+            }
+        }
+        done_783:;
     }
 
     // --- 6. Peón corona con jaque (784-785) ---
