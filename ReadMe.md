@@ -78,7 +78,7 @@ Las posiciones provienen de millones de partidas de alto nivel (principalmente e
    resultado := (resul * tot + evfinal * peso) / (tot + peso);
    ```
 
-> **Nota del autor:** El resultado de todo esto es una etiqueta bastante disparatada que, muy probablemente, vuelve locos los gradientes en todas direcciones y hace que mi red converja a cualquier sitio raro del espacio de soluciones. *Pero al menos es original.*
+> **Nota:** El resultado de todo esto es una etiqueta bastante disparatada que, muy probablemente, vuelve locos los gradientes en todas direcciones y hace que mi red converja a cualquier sitio raro del espacio de soluciones. *Pero al menos es original.*
 
 ## 🏋️ Entrenamiento del Modelo
 
