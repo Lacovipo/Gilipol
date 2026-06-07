@@ -11,7 +11,7 @@ Este repositorio contiene el código fuente del motor Gilipol. Gilipol es un poc
 ## ✨ Características Destacadas
 
 * **Lazy SMP (multiprocesador)**: Requiere compilar con el flag `-DUSE_SMP`.
-* **Red Neuronal Propia**: Incluye el archivo de red `net4.bin` (con una arquitectura original y peculiar).
+* **Red Neuronal Propia**: Incluye el archivo de red `net5.bin` (con una arquitectura original y peculiar).
 * **Código en Evolución**: Algunas secciones del código están deshabilitadas con `#if (0)` porque están implementadas pero en fase de pruebas. Se irán incorporando si demuestran ser productivas.
 * **Aritmética Float**: La red utiliza aritmética `float` (en lugar de cuantización), ya que las pruebas iniciales con cuantización no aportaron ganancias de velocidad y complicaron el desarrollo.
 
