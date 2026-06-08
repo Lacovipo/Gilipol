@@ -35,10 +35,10 @@ int opt_syzygy_50move_rule = 1;
 char opt_nnue_path[1024] = "net5.bin";
 
 // QS
-int opt_qs_poda_delta =             98;
-int opt_qs_fut_margin =             70;
+int opt_qs_poda_delta =             91;
+int opt_qs_fut_margin =             86;
+int opt_qs_see =                    -66;
 //int opt_qs_lmp =                    10;
-int opt_qs_see =                    -85;
 
 // Razoring
 int opt_bus_razor_depth =           4;
@@ -952,7 +952,7 @@ int main()
 
         if (strcmp(command, "uci") == 0)
         {
-            printf("id name Gilipol 2.00\n");
+            printf("id name Gilipol 2.01 Optim QS\n");
             printf("id author Jose Carlos Martinez Galan\n");
             printf("option name Hash type spin default 32 min 1 max 1024\n");
             #ifdef USE_SMP

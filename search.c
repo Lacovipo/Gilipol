@@ -223,7 +223,10 @@ static void print_score(int score)
  * read_tt (retorna: 1 si hace cutoff, 0 si no; siempre intenta devolver best_move si encuentra la posición)
  * 
  */
-int read_tt(uint64_t hash, int depth, int ply, int alpha, int beta, int* score, Move* best_move, int* tt_depth, int* tt_flag)
+// tt_eval: eval estática pura guardada en TT (salida NNUE de una búsqueda anterior).
+//          Se inicializa a -INFINITO; se rellena si hay hit, independientemente de si hay cutoff.
+//          Permite evitar llamadas a nnue_evaluate() en visitas repetidas a la misma posición.
+int read_tt(uint64_t hash, int depth, int ply, int alpha, int beta, int* score, Move* best_move, int* tt_depth, int* tt_flag, int* tt_eval)
 {
     if (!tt_table || tt_cluster_count == 0)
         return 0;
@@ -238,6 +241,8 @@ int read_tt(uint64_t hash, int depth, int ply, int alpha, int beta, int* score, 
         *tt_depth = 0;
     if (tt_flag)
         *tt_flag = 0;
+    if (tt_eval)
+        *tt_eval = -INFINITO;  // Centinela: sin eval válida hasta que encontremos la entrada
 
     // Buscar en las 4 ranuras
     TTEntry* found_entry = NULL;
@@ -263,6 +268,12 @@ int read_tt(uint64_t hash, int depth, int ply, int alpha, int beta, int* score, 
         *tt_depth = found_entry->depth;
     if (tt_flag)
         *tt_flag = found_entry->flag;
+
+    // Devolver la eval estática guardada (para evitar llamada a NNUE).
+    // Nota: write_tt solo guarda valores en rango normal [±TB_MAX]; -INFINITO nunca
+    // aparece aquí salvo como centinela de no-encontrado (ver inicialización arriba).
+    if (tt_eval && found_entry->depth > 0)
+        *tt_eval = (int)found_entry->eval;
 
     // Solo hacer cutoff si la profundidad es suficiente
     int tt_val = score_from_tt(found_entry->score, ply);
@@ -674,7 +685,8 @@ int quiescence(Position* pos, int alpha, int beta, int ply, SearchData* sd)
     Move tt_move = MOVE_NONE;
     int tt_depth = 0;
     int tt_flag = 0;
-    if (read_tt(pos->hash, 0, ply, alpha, beta, &tt_score, &tt_move, &tt_depth, &tt_flag))
+    int tt_eval = -INFINITO;   // eval estática guardada en TT (−INFINITO = sin dato válido)
+    if (read_tt(pos->hash, 0, ply, alpha, beta, &tt_score, &tt_move, &tt_depth, &tt_flag, &tt_eval))
         return tt_score;
     const bool bHayScoreTT = (tt_depth > 0); // Usamos depth > 0 para detectar entrada válida, incluso sin movimiento (común en TT_ALPHA)
 
@@ -691,11 +703,16 @@ int quiescence(Position* pos, int alpha, int beta, int ply, SearchData* sd)
 
     //
     // Eval estática (sólo si no estamos en jaque)
-    // 
+    //
+    // Usamos tt_eval (guardada en TT) si está disponible para evitar la llamada a nnue_evaluate().
+    // tt_eval es la salida pura de NNUE guardada en una búsqueda anterior → igual de válida.
+    //
     int stand_pat = -INFINITO;
     if (!in_check)
     {
-        stand_pat = nnue_evaluate(pos);
+        // Usar tt_eval si está disponible; aplicar ajuste de 50 jugadas sobre raw_eval.
+        int qs_raw = (bHayScoreTT && tt_eval != -INFINITO) ? tt_eval : nnue_evaluate(pos);
+        stand_pat = qs_raw * (200 - pos->half_move_clock) / 200;
 
         // Si tenemos un lower bound de la TT (TT_BETA) que es mayor que la evaluación estática,
         // lo usamos para mejorar la precisión de stand_pat.
@@ -913,11 +930,12 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
     Move tt_move = MOVE_NONE;
     int tt_depth = 0;
     int tt_flag = 0;
+    int tt_eval = -INFINITO;   // eval estática guardada en TT (−INFINITO = sin dato válido)
     if (excluded_move == MOVE_NONE)
     {
         if (ply == 0) // en la raíz, consultamos pero no cortamos
-            read_tt(pos->hash, depth, ply, alpha, beta, &tt_score, &tt_move, &tt_depth, &tt_flag);
-        else if (read_tt(pos->hash, depth, ply, alpha, beta, &tt_score, &tt_move, &tt_depth, &tt_flag))
+            read_tt(pos->hash, depth, ply, alpha, beta, &tt_score, &tt_move, &tt_depth, &tt_flag, &tt_eval);
+        else if (read_tt(pos->hash, depth, ply, alpha, beta, &tt_score, &tt_move, &tt_depth, &tt_flag, &tt_eval))
             // OJO: para podar, añadir la condición de que el contador de 50 no esté muy cerca de las tablas (< 90 o algo así)
             return tt_score;
     }
@@ -972,23 +990,35 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
 
     //
     // Eval estática (sólo si no estamos en jaque)
-    // 
+    //
+    // raw_eval   : salida pura de nnue_evaluate() o tt_eval guardada.
+    //              Se escribe en TT al final del nodo. NUNCA es tt_score.
+    // static_eval: raw_eval, opcionalmente mejorada con tt_score para decisiones de poda.
+    //              Puede ser tt_score; no se escribe en TT.
+    //
     int static_eval = -INFINITO;
+    int raw_eval    = -INFINITO;
     if (!in_check)
     {
+        // Usar tt_eval si está disponible para evitar la llamada a nnue_evaluate()
+        raw_eval = (bHayScoreTT && tt_eval != -INFINITO) ? tt_eval : nnue_evaluate(pos);
+
+        // Aplicar ajuste por regla de 50 jugadas AQUÍ, no en nnue_evaluate().
+        // raw_eval es una propiedad pura de la posición (se guarda/lee de TT sin este ajuste).
+        // static_eval es el valor contextual que usan las podas.
+        static_eval = raw_eval * (200 - pos->half_move_clock) / 200;
+
+        // Mejorar static_eval con el tt_score si es un bound fiable en la dirección correcta
+        // (igual que Alexandria). Mejora la calidad de las podas sin contaminar raw_eval.
         if (bHayScoreTT)
         {
             if (tt_flag == TT_EXACT
-                || (tt_flag == TT_ALPHA && tt_score < alpha)
-                || (tt_flag == TT_BETA && tt_score > beta))
+                || (tt_flag == TT_ALPHA && tt_score < static_eval)
+                || (tt_flag == TT_BETA  && tt_score > static_eval))
             {
                 static_eval = tt_score;
             }
-            else
-                static_eval = nnue_evaluate(pos);
         }
-        else
-            static_eval = nnue_evaluate(pos);
     }
     
     //
@@ -1746,11 +1776,14 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
             return 0; // Ahogado (Tablas)
     }
 
-    // Guardar en TT
+    // Guardar en TT.
+    // Se escribe raw_eval (salida pura de NNUE), NUNCA static_eval.
+    // static_eval puede contener tt_score (un score de búsqueda) y contaminaría
+    // el campo eval de futuras entradas si se guardara aquí.
     if (excluded_move == MOVE_NONE)
     {
         tt_flag = (best_score <= original_alpha) ? TT_ALPHA : (best_score >= beta ? TT_BETA : TT_EXACT);
-        write_tt(pos->hash, depth, ply, best_score, tt_flag, best_move_this_node, static_eval);
+        write_tt(pos->hash, depth, ply, best_score, tt_flag, best_move_this_node, raw_eval);
     }
 
     return best_score;
@@ -2533,7 +2566,7 @@ void search_position(Position* pos, SearchLimits limits)
             int tt_score, tt_depth, tt_flag;
             Move tt_move = MOVE_NONE;
             // Consultar TT. Los valores de alpha/beta/depth no importan para recuperar el movimiento.
-            read_tt(next_pos.hash, 0, 0, -INFINITO, INFINITO, &tt_score, &tt_move, &tt_depth, &tt_flag);
+            read_tt(next_pos.hash, 0, 0, -INFINITO, INFINITO, &tt_score, &tt_move, &tt_depth, &tt_flag, NULL);
             if (tt_move != MOVE_NONE)
                 ponder_move = tt_move;
         }

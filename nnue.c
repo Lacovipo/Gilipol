@@ -718,9 +718,6 @@ int nnue_evaluate(const Position* pos)
     if (pos->side_to_move == BLACK)
         score = -score;
 
-    // Ajustar con respecto a la regla de 50 jugadas (aproximo hacia la mitad de la eval estática)
-    score = score * (200 - pos->half_move_clock) / 200;
-
     // Asegurar que no sobrepase límites
     score = clamp_int(score, -TB_MAX+1, TB_MAX-1);
 

@@ -423,7 +423,7 @@ long long get_time_ms();
 // Parámetros de búsqueda
 //
 
-#define OPTIMIZAR_QS        1
+#define OPTIMIZAR_QS        0
 #define OPTIMIZAR_RAZOR     0   // Razoring normal y Full Razoring
 #define OPTIMIZAR_PODAJC    0
 #define OPTIMIZAR_SEEP      0   // SEE Pruning (with history)
@@ -445,13 +445,13 @@ long long get_time_ms();
 #if (OPTIMIZAR_QS)
     #define QS_PODA_DELTA               opt_qs_poda_delta
     #define QS_FUT_MARGIN               opt_qs_fut_margin
-    //#define QS_LMP                      opt_qs_lmp
     #define QS_SEE                      opt_qs_see
+    //#define QS_LMP                      opt_qs_lmp
 #else
-    #define QS_PODA_DELTA               98
-    #define QS_FUT_MARGIN               70
+    #define QS_PODA_DELTA               91
+    #define QS_FUT_MARGIN               86
+    #define QS_SEE                      -66
     //#define QS_LMP                      10
-    #define QS_SEE                      -85
 #endif
 
 #if (OPTIMIZAR_RAZOR)
