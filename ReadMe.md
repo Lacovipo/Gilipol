@@ -37,6 +37,10 @@ Gilipol implementa una red neuronal con una arquitectura de:
 * **Capa de entrada (786):** Contiene la posición de las piezas, el turno, los derechos de enroque y algunas características *ad-hoc* diseñadas para ayudar a la red a comprender la dinámica de ciertas situaciones.
 * **Capas ocultas:** Van reduciendo su tamaño con el objetivo de abstraer y generalizar el conocimiento. *Me gusta fantasear con la idea de que la red imita al ajedrecista humano, de modo que en las últimas 32 neuronas logra abstraer conceptos complejos (estructura de peones, seguridad del rey, actividad de las piezas) para construir una evaluación "humana".*
 
+<p align="center">
+  <img src=".\img\activation_map.png" alt="Mapa de activación de neuronas para la posición inicial" width="600">
+</p>
+
 ### Origen de los Datos y Generación de Etiquetas
 
 Las posiciones provienen de millones de partidas de alto nivel (principalmente entre motores, pero también humanas). Se almacenan en una base de datos PostgreSQL y se someten a un complejo proceso de etiquetado:
