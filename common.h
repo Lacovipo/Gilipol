@@ -465,12 +465,12 @@ long long get_time_ms();
     #define BUS_FULLRAZ_BASE            opt_bus_fullraz_base
     #define BUS_FULLRAZ_MULT            opt_bus_fullraz_mult
 #else
-    #define BUS_RAZOR_DEPTH             4   // 12/04/26 // OJO: preparado hasta 5, pero sin probar
-    #define BUS_RAZOR_MARGIN1           75  // 07/04/26
-    #define BUS_RAZOR_MARGIN2           130 // 08/04/26
-    #define BUS_RAZOR_MARGIN3           315 // 11/04/26
-    #define BUS_RAZOR_MARGIN4           500 // 12/04/26
-    #define BUS_RAZOR_MARGIN5           700
+    #define BUS_RAZOR_DEPTH             4   // OJO: preparado hasta 5, pero Probon se queda en 4, y muy justo
+    #define BUS_RAZOR_MARGIN1           110
+    #define BUS_RAZOR_MARGIN2           230
+    #define BUS_RAZOR_MARGIN3           420
+    #define BUS_RAZOR_MARGIN4           930
+    #define BUS_RAZOR_MARGIN5           1200
     #define BUS_FULLRAZ_USE             0
     #define BUS_FULLRAZ_BASE            350
     #define BUS_FULLRAZ_MULT            260

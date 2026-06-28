@@ -42,11 +42,11 @@ int opt_qs_see =                    -66;
 
 // Razoring
 int opt_bus_razor_depth =           4;
-int opt_bus_razor_margin1 =         75;
-int opt_bus_razor_margin2 =         130;
-int opt_bus_razor_margin3 =         315;
-int opt_bus_razor_margin4 =         500;
-int opt_bus_razor_margin5 =         700;
+int opt_bus_razor_margin1 =         110;
+int opt_bus_razor_margin2 =         230;
+int opt_bus_razor_margin3 =         420;
+int opt_bus_razor_margin4 =         930;
+int opt_bus_razor_margin5 =         1200;
 int opt_bus_fullraz_base =          350;
 int opt_bus_fullraz_mult =          260;
 
@@ -952,7 +952,7 @@ int main()
 
         if (strcmp(command, "uci") == 0)
         {
-            printf("id name Gilipol 2.01 Optim QS\n");
+            printf("id name Gilipol 2.02 Optim Raz\n");
             printf("id author Jose Carlos Martinez Galan\n");
             printf("option name Hash type spin default 32 min 1 max 1024\n");
             #ifdef USE_SMP
@@ -974,14 +974,14 @@ int main()
             #endif
 
             #if (OPTIMIZAR_RAZOR)
-                printf("option name BusRazorDepth type spin default %d min 1 max 15\n", opt_bus_razor_depth);           // 4
-                printf("option name BusRazorMargin1 type spin default %d min 0 max 200\n", opt_bus_razor_margin1);      // 75
-                printf("option name BusRazorMargin2 type spin default %d min 20 max 400\n", opt_bus_razor_margin2);     // 130
-                printf("option name BusRazorMargin3 type spin default %d min 40 max 600\n", opt_bus_razor_margin3);     // 315
-                printf("option name BusRazorMargin4 type spin default %d min 60 max 1000\n", opt_bus_razor_margin4);    // 500
-                printf("option name BusRazorMargin5 type spin default %d min 500 max 1200\n", opt_bus_razor_margin5);
-                printf("option name BusFullrazBase type spin default %d min 0 max 2000\n", opt_bus_fullraz_base);       // 350
-                printf("option name BusFullrazMult type spin default %d min 0 max 1000\n", opt_bus_fullraz_mult);       // 260
+                printf("option name BusRazorDepth type spin default %d min 1 max 15\n", opt_bus_razor_depth);
+                printf("option name BusRazorMargin1 type spin default %d min 0 max 250\n", opt_bus_razor_margin1);
+                printf("option name BusRazorMargin2 type spin default %d min 200 max 600\n", opt_bus_razor_margin2);
+                printf("option name BusRazorMargin3 type spin default %d min 300 max 800\n", opt_bus_razor_margin3);
+                printf("option name BusRazorMargin4 type spin default %d min 600 max 1200\n", opt_bus_razor_margin4);
+                printf("option name BusRazorMargin5 type spin default %d min 800 max 2000\n", opt_bus_razor_margin5);
+                printf("option name BusFullrazBase type spin default %d min 0 max 2000\n", opt_bus_fullraz_base);
+                printf("option name BusFullrazMult type spin default %d min 0 max 1000\n", opt_bus_fullraz_mult);
             #endif
 
             #if (OPTIMIZAR_PODAJC)

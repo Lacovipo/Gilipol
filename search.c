@@ -1003,13 +1003,10 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
         // Usar tt_eval si está disponible para evitar la llamada a nnue_evaluate()
         raw_eval = (bHayScoreTT && tt_eval != -INFINITO) ? tt_eval : nnue_evaluate(pos);
 
-        // Aplicar ajuste por regla de 50 jugadas AQUÍ, no en nnue_evaluate().
-        // raw_eval es una propiedad pura de la posición (se guarda/lee de TT sin este ajuste).
-        // static_eval es el valor contextual que usan las podas.
+        // Aplicar ajuste por regla de 50 jugadas
         static_eval = raw_eval * (200 - pos->half_move_clock) / 200;
 
         // Mejorar static_eval con el tt_score si es un bound fiable en la dirección correcta
-        // (igual que Alexandria). Mejora la calidad de las podas sin contaminar raw_eval.
         if (bHayScoreTT)
         {
             if (tt_flag == TT_EXACT
@@ -1040,7 +1037,7 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
                 Position* prev4_pos = prev_pos->prev->prev;
                 const bool prev4_in_check = (prev4_pos->eval == -INFINITO);
 
-                // Si hace 4 también estábamos en jaque, O si la eval actual es mejor que hace 4
+                // Si hace 4 también estábamos en jaque, o si la eval actual es mejor que hace 4
                 if (prev4_in_check || static_eval > prev4_pos->eval)
                     bMejorando = true;
             }
