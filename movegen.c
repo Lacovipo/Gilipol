@@ -10,26 +10,38 @@
 // --- Utilidades ---
 
 // Imprime un movimiento en formato UCI (ej. "e2e4", "a7a8q")
-void print_move(Move move)
+// Jugada en notacion UCI ("e2e4", "e7e8q"). Para componer una linea entera y
+// escribirla de una vez: si se escribe a trozos, otra salida del hilo UCI puede
+// colarse en medio (B19).
+void move_to_str(Move move, char* out)
 {
-    int source = GET_MOVE_SOURCE(move);
-    int target = GET_MOVE_TARGET(move);
-    int promoted = GET_MOVE_PROMOTED(move);
-    
-    printf("%c%d%c%d", (source % 8) + 'a', (source / 8) + 1, (target % 8) + 'a', (target / 8) + 1);
-           
+    const int source = GET_MOVE_SOURCE(move);
+    const int target = GET_MOVE_TARGET(move);
+    const int promoted = GET_MOVE_PROMOTED(move);
+
+    out[0] = (char)('a' + source % 8);
+    out[1] = (char)('1' + source / 8);
+    out[2] = (char)('a' + target % 8);
+    out[3] = (char)('1' + target / 8);
+    out[4] = 0;
     if (promoted)
     {
-        char p = ' ';
-        switch(promoted)
+        switch (promoted)
         {
-            case KNIGHT: p = 'n'; break;
-            case BISHOP: p = 'b'; break;
-            case ROOK:   p = 'r'; break;
-            case QUEEN:  p = 'q'; break;
+            case KNIGHT: out[4] = 'n'; break;
+            case BISHOP: out[4] = 'b'; break;
+            case ROOK:   out[4] = 'r'; break;
+            default:     out[4] = 'q'; break;
         }
-        printf("%c", p);
+        out[5] = 0;
     }
+}
+
+void print_move(Move move)
+{
+    char s[8];
+    move_to_str(move, s);
+    printf("%s", s);
 }
 
 // Añade un movimiento a la lista (helper interno)
@@ -314,9 +326,8 @@ static void generate_evasions(const Position* pos, MoveList* list)
 
     if (!checkers)
     {
-        printf("ERROR CRITICO: is_square_attacked() es true pero attackers_of() es 0!\n");
-        printf("Side: %d, KingSq: %d\n", side, king_sq);
-        print_board(pos);
+        printf("info string ERROR CRITICO: is_square_attacked() es true pero attackers_of() es 0 (bando %d, rey %d)\n",
+               side, king_sq);   // con prefijo: una linea suelta rompe el protocolo (I29)
         ATOMIC_STORE(stop_search, 1);
         return;
     }
@@ -646,7 +657,7 @@ int see(const Position* pos, Move move, int threshold)
     // Esto implica que el intercambio es favorable para nosotros (ganamos más de lo que arriesgamos al exponer el atacante).
     balance = see_values[attacker_type] - balance;
     
-    if (balance < 0)
+    if (balance <= 0)
         return 1;
 
     // 3. Simular ocupación
@@ -711,12 +722,24 @@ int see(const Position* pos, Move move, int threshold)
         // Actualizar balance
         balance = see_values[lva_type] - balance;
         
-        // Si balance < 0, el bando actual (stm) ha hecho una captura buena (gana material o refuta el threshold).
-        // Si stm != side (es el oponente), significa que ha refutado nuestro threshold -> return 0.
-        // Si stm == side (somos nosotros), significa que hemos recuperado -> return 1.
-        if (balance < 0)
+        // OJO: el umbral ALTERNA con el bando.
+        //
+        // A nosotros nos basta con igualar el umbral para que see() sea cierto
+        // (SEE >= threshold), asi que paramos con balance <= 0. El rival necesita
+        // superarlo estrictamente, o sea balance < 0. Es la misma alternancia que
+        // Stockfish codifica con "swap < res", donde res va alternando 0 y 1.
+        //
+        // Con < 0 para los dos bandos se perdian intercambios que acaban EXACTAMENTE
+        // en el umbral. Ejemplo real, sacado por el test de validacion:
+        //
+        //   r3k2r/p1ppqpb1/bn2Pnp1/4N3/1p2P3/2N2Q2/PPPBBPpP/R3K2R w KQkq -   Cxd7
+        //
+        // Atacan d7: blancas Ce5 y Pe6; negras Cb6, Cf6, De7 y Re8. La secuencia
+        // es Cxd7 Cb6xd7 exd7 Cf6xd7 = +100 -320 +320 -100 = 0, o sea SEE justo
+        // igual al umbral, y see(m, 0) devolvia falso.
+        if (balance < (stm == side ? 1 : 0))
             return (stm == side);
-        
+
         // Rayos X: Añadir sliders descubiertos detrás de la pieza movida
         attackers |= (get_bishop_attacks(to, occupancy) & bishops);
         attackers |= (get_rook_attacks(to, occupancy) & rooks);

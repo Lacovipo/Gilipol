@@ -12,10 +12,54 @@
 #include <stdint.h>
 #include <immintrin.h>
 
+// CPU detectada al arrancar (detectar_cpu, en nnue.c). El ejecutable de distribucion
+// se compila para x86-64 generico y elige en tiempo de ejecucion las variantes AVX-512,
+// AVX2 o generica de la red, PEXT o magic bitboards y POPCNT o no.
+enum { CPU_GENERICA = 0, CPU_AVX2 = 1, CPU_AVX512 = 2 };
+extern int cpu_nivel;       // CPU_*: variante de la red y del acumulador
+extern int cpu_pext;        // 1 = PEXT rapido (BMI2, y no AMD anterior a Zen 3)
+extern int cpu_popcnt;      // 1 = instruccion POPCNT
+void        detectar_cpu(void);
+const char* nombre_cpu(void);
+
+// Redes incluidas en el ejecutable. EvalFile/TCFile con este nombre (o vacio) usan
+// la copia interna; con cualquier otro, la cargan de disco.
+#define RED_POR_DEFECTO     "net5.bin"
+#define TC_POR_DEFECTO      "tcnet5.bin"
+
 #define MATE_SCORE 32000
 #define MATE_BOUND 31000
 #define INFINITO 32001
 #define TB_MAX 30000
+#define MAX_PLY 128
+
+// Zona de puntuaciones de tablebase.
+// probe_syzygy devuelve +-(TB_MAX - ply), con ply < MAX_PLY, asi que todo score
+// de TB cae en [TB_BOUND, TB_MAX]. Igual que los mates, depende del ply y por
+// tanto hay que ajustarlo al guardarlo/leerlo en la tabla hash.
+#define TB_BOUND (TB_MAX - MAX_PLY)
+
+// Corte por hash en nodos PV.
+//
+//  1 = se corta (comportamiento historico de Gilipol)
+//  0 = no se corta (lo que hace Stockfish: mejor PV y raiz mas estable)
+//
+// Poner a 0 cuesta un 15 % de nodos y un 22 % de tiempo medidos en bench. A cambio
+// deja de truncar la PV. NO esta probado con SPRT: es el candidato numero uno a test.
+#define TT_CORTE_EN_PV              1
+
+// Cota de la evaluacion estatica: nunca debe invadir la zona de TB ni la de mate,
+// o score_to_tt/score_from_tt la confundirian con una distancia a tablebase.
+#define EVAL_MAX (TB_BOUND - 1)
+
+// Centinela de "esta entrada de la TT no trae eval estatica".
+//
+// Antes se usaba -INFINITO, que ademas es el valor que negamax deja en raw_eval
+// cuando el nodo esta en jaque: o sea que "no hay dato" y "habia jaque" acababan
+// siendo el mismo numero por casualidad. Funcionaba, pero se rompia solo con que
+// alguien cambiase INFINITO o el tipo del campo. INT16_MIN esta fuera del rango de
+// cualquier evaluacion legitima (acotada a +-EVAL_MAX) y no colisiona con nada.
+#define EVAL_NONE (-32768)
 
 // ============================================================================
 // COMPILACIÓN CONDICIONAL: SMP vs SINGLE-THREAD
@@ -53,6 +97,15 @@
     #define ATOMIC_STORE_REL(x, v)      ((x) = (v))
     #define ATOMIC_FETCH_ADD(x, v)      ((x) += (v))  // En single-thread no necesitamos el valor anterior
 #endif
+
+// Banderas de control compartidas entre el hilo UCI y el de busqueda (stop, ponder,
+// limites de tiempo...). Tambien en monohilo hay dos hilos, asi que son atomicas en
+// las DOS compilaciones: con int simple era una carrera de datos (UB en C11) que solo
+// funcionaba porque cada bucle de sondeo llamaba a una funcion opaca (B20). Se leen
+// y escriben con las mismas macros ATOMIC_*: en x86 la carga es un MOV normal.
+#include <stdatomic.h>
+#define SHARED_INT                  atomic_int
+#define SHARED_LLONG                atomic_llong
 
 #define MAX_MOVES_BUFFER 2048
 
@@ -108,6 +161,7 @@ struct Position
     Bitboard all;                             // Ocupación total
     
     uint64_t hash;          // Zobrist Hash de la posición
+    uint64_t pawn_hash;     // Zobrist sólo de los peones (para correction history)
     int side_to_move;       // WHITE o BLACK
     int en_passant_sq;      // Casilla SQ_... o SQ_NONE
     int castling_rights;    // Máscara de bits (OR de CastlingRights)
@@ -128,10 +182,11 @@ typedef struct
     int binc;       // Incremento negras (ms)
     int movestogo;  // Movimientos hasta el control de tiempo
     int depth;      // Profundidad máxima
-    int nodes;      // Nodos máximos
+    long long nodes; // Nodos máximos (0 = sin límite)
     int movetime;   // Tiempo fijo por movimiento
     bool infinite;  // Analizar hasta recibir comando 'stop'
     bool ponder;    // Modo Ponder (pensar en tiempo del oponente)
+    bool reloj;     // Llego wtime o btime (aunque valgan 0 o menos): hay que gestionar el tiempo (B12)
 } SearchLimits;
 
 // --- Codificación de Movimientos (Entero de 32 bits) ---
@@ -203,12 +258,15 @@ void init_tt();
 void clear_tt();
 void resize_tt(int mb);
 void tt_new_search();  // Llamar al inicio de cada búsqueda (incrementa generación)
+void tt_prefetch(uint64_t hash); // Traer la linea de cache de la TT por adelantado
 
 // --- Globales de Control ---
-#define MAX_GAME_HISTORY 1024
+#define MAX_GAME_HISTORY 16384  // un 'position ... moves' de 64 KB cabe entero (I35)
 
-extern ATOMIC_INT stop_search;
-extern ATOMIC_INT is_searching;
+extern SHARED_INT stop_search;      // parar la busqueda: GUI, limite de nodos o de tiempo
+extern SHARED_INT stop_gui;         // parada pedida por el GUI: la unica que acaba infinite/ponder (B13)
+extern long long last_search_nodes;  // Nodos de la ultima busqueda (main + helpers). Lo usa 'bench'.
+extern SHARED_INT is_searching;
 extern uint64_t game_history[MAX_GAME_HISTORY];
 extern int game_history_count;
 extern int opt_threads;
@@ -223,6 +281,9 @@ extern int opt_qs_poda_delta;
 extern int opt_qs_fut_margin;
 //extern int opt_qs_lmp;
 extern int opt_qs_see;
+extern int opt_qs_improve;
+extern int opt_qs_stable;
+extern int opt_qs_worsen;
 extern int opt_ext_limit_multiplier;
 extern int opt_lmp_base;
 extern int opt_lmp_depth;
@@ -232,14 +293,24 @@ extern int opt_bus_nm_div;
 extern int opt_bus_nm_imp;
 extern int opt_bus_nm_r;
 extern int opt_bus_nm_verif;
+extern int opt_bus_nm_ifworsen;
+extern int opt_bus_nm_willimprove;
+extern int opt_bus_nm_isstable;
+extern int opt_bus_nm_willworsen;
 extern int opt_bus_iid_depthmin;
+extern int opt_bus_iid_improve;
+extern int opt_bus_iid_worsen;
 extern int opt_bus_podajc_depth;
 extern int opt_bus_podajc_margin;
 extern int opt_bus_podajc_cero;
+extern int opt_bus_podajc_ifworsen;
 extern int opt_bus_iir_depth;
 extern int opt_bus_iir_pvred;
 extern int opt_bus_iir_cutred;
 extern int opt_bus_iir_allred;
+extern int opt_bus_iir_pv_stable;
+extern int opt_bus_iir_cut_improve;
+extern int opt_bus_iir_all_worsen;
 extern int opt_bus_razor_depth;
 extern int opt_bus_razor_margin1;
 extern int opt_bus_razor_margin2;
@@ -248,6 +319,8 @@ extern int opt_bus_razor_margin4;
 extern int opt_bus_razor_margin5;
 extern int opt_bus_fullraz_base;
 extern int opt_bus_fullraz_mult;
+extern int opt_bus_fullraz_improve;
+extern int opt_bus_fullraz_worsen;
 extern int opt_lmr_base_depth;
 extern int opt_lmr_base_move;
 extern int opt_poda_hash_beta_prof_dif;
@@ -282,6 +355,9 @@ extern int opt_cfp_mult;
 extern int opt_probcut_depth;
 extern int opt_probcut_margin;
 extern int opt_probcut_reduction;
+extern int opt_probcut_willimprove;
+extern int opt_probcut_isstable;
+extern int opt_probcut_willworsen;
 extern int opt_lmr_check_depth;
 extern int opt_lmr_cut_depth;
 extern int opt_lmr_mejo_depth;
@@ -293,6 +369,17 @@ extern int opt_lmr_hist_menos1;
 extern int opt_lmr_hist_mas1;
 extern int opt_lmr_chist_mas1;
 extern int opt_lmr_chist_menos1;
+extern int opt_lmr_tc_willimprove;
+extern int opt_lmr_tc_willworsen;
+extern int opt_lmr_tc_isstable;
+extern int opt_lmr_tc_wllimpbeta;
+extern int opt_lmr_tc_wilworalpha;
+extern int opt_tc_threshold;
+extern int opt_tc_dir_min_depth;
+extern int opt_corr_grain;
+extern int opt_corr_limit;
+extern int opt_corr_peso;
+extern char opt_tc_path[1024];
 extern int opt_se_min_depth;
 extern int opt_se_tt_depth_margin;
 extern int opt_se_margin_base;
@@ -317,6 +404,36 @@ typedef struct
 
 extern NNUEWeights nnue_weights;
 
+// Pesos del clasificador táctico (32→16→3)
+#define TC_INPUT   32
+#define TC_HIDDEN  16
+#define TC_OUTPUT   3
+
+typedef struct
+{
+    float W1[TC_INPUT][TC_HIDDEN];   // [in][out], ya transpuesto al cargar
+    float b1[TC_HIDDEN];
+    float W2[TC_HIDDEN][TC_OUTPUT];  // [in][out], ya transpuesto al cargar
+    float b2[TC_OUTPUT];
+} TacticalWeights;
+
+typedef struct
+{
+    float p_mejora;
+    float p_estable;
+    float p_empeora;
+} TacticalClass;
+
+extern TacticalWeights tc_weights;
+extern int             tc_initialized;
+int         nnue_tc_init(const char* path);  // 1 si carga; si falla se conserva el anterior
+int         nnue_tc_init_interna(void);      // el clasificador incluido en el ejecutable
+// Igual que nnue_evaluate, pero permite saltarse el clasificador tactico cuando
+// el llamante no lo va a mirar. tc_compute() cuesta el 20 % de una evaluacion
+// (tres expf en el softmax), y en quiescence su resultado se multiplica por cero.
+int         nnue_evaluate_tc(const Position* pos, int calcular_tc);
+TacticalClass nnue_get_tc(void);
+
 // --- Macros de Bitboards (Helpers) ---
 #define SET_BIT(bb, sq) ((bb) |= (1ULL << (sq)))
 #define GET_BIT(bb, sq) ((bb) & (1ULL << (sq)))
@@ -327,7 +444,17 @@ static inline int count_bits(Bitboard bb)
 {
 #if defined(_MSC_VER) || defined(__INTEL_COMPILER)
     return __popcnt64(bb);
+#elif defined(__POPCNT__)
+    return __builtin_popcountll(bb);
 #else
+    // Ejecutable generico: la instruccion POPCNT solo si la CPU la tiene. Va en
+    // ensamblador porque el compilador no la emite sin -mpopcnt.
+    if (cpu_popcnt)
+    {
+        uint64_t r;
+        __asm__("popcntq %1, %0" : "=r"(r) : "rm"(bb));
+        return (int)r;
+    }
     return __builtin_popcountll(bb);
 #endif
 }
@@ -345,11 +472,12 @@ static inline int get_lsb_index(Bitboard bb)
 }
 
 // Optimización: Pop LSB (Eliminar el bit menos significativo y devolver su índice)
-// Usa instrucción BLSR (BMI1) para limpiar el bit: bb &= (bb - 1)
+// bb &= (bb - 1): con BMI1 el compilador lo convierte solo en BLSR. La intrinseca
+// _blsr_u64 no compilaba en el ejecutable generico.
 static inline int pop_lsb(Bitboard* bb)
 {
     int sq = get_lsb_index(*bb);
-    *bb = _blsr_u64(*bb); // Intrínseca directa para bb &= bb - 1
+    *bb &= *bb - 1;
     return sq;
 }
 
@@ -376,12 +504,13 @@ static inline int RedondeoSimetricoBase3(int r)
 }
 
 // --- Prototipos de funciones (position.c) ---
-void parse_fen(Position* pos, const char* fen);
+int parse_fen(Position* pos, const char* fen);  // 1 si es valido; si no, *pos no se toca
 void print_board(const Position* pos);
 void copy_position(Position* dest, const Position* src);
 int make_move(Position* pos, Move move);
 void make_null_move(Position* pos);
 void init_zobrist(); // Inicializar claves aleatorias
+uint64_t compute_pawn_hash(const Position* pos);
 int is_repetition(const Position* pos);
 
 // --- Prototipos de funciones (bitboards.c) ---
@@ -399,30 +528,103 @@ int is_square_attacked(const Position* pos, int sq, int side);
 void generate_moves(const Position* pos, MoveList* move_list, int gen_type);
 void generate_captures(const Position* pos, MoveList* move_list);
 void print_move(Move move);
+void move_to_str(Move move, char* out);   // "e2e4" o "e7e8q"; out de 6 bytes como minimo
+extern int salida_busqueda;   // 0 = search_position no imprime info ni bestmove (bench)
 int see(const Position* pos, Move move, int threshold);
 
 // --- Prototipos de funciones (evaluate.c) ---
 int evaluate(const Position* pos);
 
 // --- Prototipos de funciones (nnue.c) ---
-void nnue_init(const char* path);
+int nnue_init(const char* path);    // 1 si carga; si falla se conserva la red anterior (B15)
+int nnue_init_interna(void);        // la red incluida en el ejecutable
+void nnue_acumular(float* acc, int feature, int signo);   // acc +-= W1[feature], con SIMD si hay
 int nnue_evaluate(const Position* pos);
 void nnue_refresh_accumulator(Position* pos);
 
 // --- Prototipos de funciones (search.c) ---
 void search_position(Position* pos, SearchLimits limits);
+void preparar_busqueda(const Position* pos, SearchLimits limits); // en el hilo UCI, antes de crear el de busqueda (B1)
+int busqueda_espera_stop(void);     // la busqueda en curso es infinite/ponder: solo acaba con stop/ponderhit
 void engine_ponderhit();
 void clear_search_heuristics(); // Limpiar history, continuation history, etc.
 void init_razor_margin();       // Inicializar el array de márgenes de razoring
 
 // --- Prototipos de funciones (main.c / perft) ---
 void perft_test(int depth);
+void run_bench(int depth, int hash_mb);
 long long get_time_ms();
 
 //
 // Parámetros de búsqueda
 //
 
+// ============================================================================
+// Correction history
+// ============================================================================
+//
+// La red se equivoca de forma SISTEMATICA en ciertas familias de posiciones: si
+// en todas las que comparten una estructura de peones la busqueda acaba diciendo
+// 30 cp mas que la eval estatica, eso no es ruido, es un sesgo que se puede medir
+// y descontar. Se guarda la diferencia media (busqueda - eval) indexada por el
+// hash de peones y se suma a la eval estatica la proxima vez.
+//
+// OJO, lo que hay que hacer bien: la correccion se aplica a static_eval, que es
+// la que se usa para podar, y NUNCA a raw_eval, que es la que se guarda en la
+// tabla hash. Si se guardase corregida, al releerla se volveria a corregir y el
+// sesgo se realimentaria solo.
+//
+// USA_CORRHIST a 0 lo desactiva entero, para poder comparar A/B.
+// Se puede forzar desde la linea de ordenes con -DUSA_CORRHIST=0 para
+// compilar la variante sin correccion y comparar A/B sin tocar el fichero.
+#ifndef USA_CORRHIST
+#define USA_CORRHIST                    1
+#endif
+#define CORR_SIZE                       16384   // potencia de 2
+
+// Conservar las heuristicas de ordenacion entre jugadas. A 0 la tabla se borra al
+// empezar cada busqueda (comportamiento antiguo); a 1 se conserva durante toda la
+// partida y solo se borra con ucinewgame. Los killers conservados se desplazan dos
+// plies, porque entre dos busquedas la partida avanza una jugada de cada bando.
+// Se activan de una en una y se apilan si la prueba A/B sale a favor.
+#ifndef CONSERVA_HISTORIA
+#define CONSERVA_HISTORIA               1       // history_moves
+#endif
+#ifndef CONSERVA_CAPTURAS
+#define CONSERVA_CAPTURAS               1       // capture_history
+#endif
+#ifndef CONSERVA_CONTRAJUGADAS
+#define CONSERVA_CONTRAJUGADAS          0       // counter_moves
+#endif
+#ifndef CONSERVA_KILLERS
+#define CONSERVA_KILLERS                0       // killer_moves
+#endif
+#ifndef CONSERVA_CORRHIST
+#define CONSERVA_CORRHIST               1       // correction_history
+#endif
+
+#ifndef OPTIMIZAR_CORR
+#define OPTIMIZAR_CORR      0
+#endif
+
+#if (OPTIMIZAR_CORR)
+    #define CORR_GRAIN                  opt_corr_grain
+    #define CORR_LIMIT                  opt_corr_limit
+    #define CORR_PESO                   opt_corr_peso
+#else
+    #define CORR_GRAIN                  256     // divisor al aplicar
+    #define CORR_LIMIT                  8173    // tope: +-32 cp de correccion
+    #define CORR_PESO                   16      // peso maximo de una muestra
+#endif
+// USA_TC a 0 quita el clasificador tactico entero: no se carga tcnet, no se calcula
+// tc_compute() y WillImprove/WillWorsen/IsStable quedan siempre a false. Se fuerza
+// con -DUSA_TC=0 para comparar A/B sin tocar el fichero, como USA_CORRHIST.
+// Desactivado por defecto desde el 17/11/2026: 6000 partidas a 5+0.05 sin TC contra
+// con TC dieron +2,2 +- 5,5 Elo (empate tecnico), y sin TC es un 5 % mas rapido.
+#ifndef USA_TC
+#define USA_TC                          0
+#endif
+#define OPTIMIZAR_TC        0   // Clasificador tactico (WillImprove/WillWorsen/IsStable en LMR)
 #define OPTIMIZAR_QS        0
 #define OPTIMIZAR_RAZOR     0   // Razoring normal y Full Razoring
 #define OPTIMIZAR_PODAJC    0
@@ -430,13 +632,18 @@ long long get_time_ms();
 #define OPTIMIZAR_SEEPOD    0   // SEE Pruning Only Depth
 #define OPTIMIZAR_CSEEP     0   // SEE de capturas (noisy)
 #define OPTIMIZAR_CFP       0   // Capture Futility Pruning
+#ifndef OPTIMIZAR_HP
 #define OPTIMIZAR_HP        0   // History Pruning
+#endif
 #define OPTIMIZAR_CHP       0   // Continuation History Pruning
 #define OPTIMIZAR_FP        0   // Futility Pruning
 #define OPTIMIZAR_IIDR      0   // IID + IIR
 #define OPTIMIZAR_LMP       0
 #define OPTIMIZAR_NM        0   // Null Move
 #define OPTIMIZAR_LMR       0
+#ifndef OPTIMIZAR_LMR_HIST
+#define OPTIMIZAR_LMR_HIST  0
+#endif
 #define OPTIMIZAR_PBCT      0   // ProbCut
 #define OPTIMIZAR_SE        0   // Singluar extension
 #define OPTIMIZAR_PHB       0   // Poda Hash Beta
@@ -446,12 +653,28 @@ long long get_time_ms();
     #define QS_PODA_DELTA               opt_qs_poda_delta
     #define QS_FUT_MARGIN               opt_qs_fut_margin
     #define QS_SEE                      opt_qs_see
+    #define QS_IMPROVE                  opt_qs_improve
+    #define QS_STABLE                   opt_qs_stable
+    #define QS_WORSEN                   opt_qs_worsen
     //#define QS_LMP                      opt_qs_lmp
 #else
-    #define QS_PODA_DELTA               91
-    #define QS_FUT_MARGIN               86
-    #define QS_SEE                      -66
+    #define QS_PODA_DELTA               91  // 98
+    #define QS_FUT_MARGIN               86  // 70
+    #define QS_SEE                      -66 // -85
+    #define QS_IMPROVE                  0
+    #define QS_STABLE                   0
+    #define QS_WORSEN                   0
     //#define QS_LMP                      10
+#endif
+
+// El clasificador tactico en qsearch solo se calcula si algun peso de QS lo usa. Al
+// tunear se fuerza a 1: si no, un clon con los tres pesos a 0 se ahorraria tc_compute()
+// e iria mas rapido, y el optimizador leeria la velocidad como merito. Lo puso 26b28fe
+// y el commit de la corrhist lo borro sin querer (B31).
+#if (OPTIMIZAR_QS)
+    #define QS_USA_TC                   1
+#else
+    #define QS_USA_TC                   (QS_IMPROVE || QS_STABLE || QS_WORSEN)
 #endif
 
 #if (OPTIMIZAR_RAZOR)
@@ -461,29 +684,35 @@ long long get_time_ms();
     #define BUS_RAZOR_MARGIN3           opt_bus_razor_margin3
     #define BUS_RAZOR_MARGIN4           opt_bus_razor_margin4
     #define BUS_RAZOR_MARGIN5           opt_bus_razor_margin5
-    #define BUS_FULLRAZ_USE             0
+    #define BUS_FULLRAZ_USE             1
     #define BUS_FULLRAZ_BASE            opt_bus_fullraz_base
     #define BUS_FULLRAZ_MULT            opt_bus_fullraz_mult
+    #define BUS_FULLRAZ_IMPROVE         opt_bus_fullraz_improve
+    #define BUS_FULLRAZ_WORSEN          opt_bus_fullraz_worsen
 #else
     #define BUS_RAZOR_DEPTH             4   // OJO: preparado hasta 5, pero Probon se queda en 4, y muy justo
-    #define BUS_RAZOR_MARGIN1           110
-    #define BUS_RAZOR_MARGIN2           230
-    #define BUS_RAZOR_MARGIN3           420
-    #define BUS_RAZOR_MARGIN4           930
+    #define BUS_RAZOR_MARGIN1           110 // 75
+    #define BUS_RAZOR_MARGIN2           230 // 130
+    #define BUS_RAZOR_MARGIN3           420 // 315
+    #define BUS_RAZOR_MARGIN4           930 // 500
     #define BUS_RAZOR_MARGIN5           1200
-    #define BUS_FULLRAZ_USE             0
-    #define BUS_FULLRAZ_BASE            350
+    #define BUS_FULLRAZ_USE             1
+    #define BUS_FULLRAZ_BASE            380
     #define BUS_FULLRAZ_MULT            260
+    #define BUS_FULLRAZ_IMPROVE         0
+    #define BUS_FULLRAZ_WORSEN          -30
 #endif
 
 #if (OPTIMIZAR_PODAJC)
     #define BUS_PODAJC_DEPTH            opt_bus_podajc_depth
     #define BUS_PODAJC_MARGIN           opt_bus_podajc_margin
     #define BUS_PODAJC_CERO             opt_bus_podajc_cero
+    #define BUS_PODAJC_IFWORSEN         opt_bus_podajc_ifworsen
 #else
-    #define BUS_PODAJC_DEPTH            10
-    #define BUS_PODAJC_MARGIN           50
-    #define BUS_PODAJC_CERO             -30
+    #define BUS_PODAJC_DEPTH            9
+    #define BUS_PODAJC_MARGIN           84
+    #define BUS_PODAJC_CERO             -46
+    #define BUS_PODAJC_IFWORSEN         0
 #endif
 
 #if (OPTIMIZAR_SEEP)
@@ -532,8 +761,8 @@ long long get_time_ms();
     #define BUS_HP_DEPTH                opt_bus_hp_depth
     #define BUS_HP_MARGIN               opt_bus_hp_margin
 #else
-    #define BUS_HP_DEPTH                9
-    #define BUS_HP_MARGIN               0
+    #define BUS_HP_DEPTH                8
+    #define BUS_HP_MARGIN               961
 #endif
 
 #if (OPTIMIZAR_CHP)
@@ -556,16 +785,26 @@ long long get_time_ms();
 
 #if (OPTIMIZAR_IIDR)
     #define BUS_IID_DEPTH_MIN           opt_bus_iid_depthmin
+    #define BUS_IID_IMPROVE             opt_bus_iid_improve
+    #define BUS_IID_WORSEN              opt_bus_iid_worsen
     #define BUS_IIR_DEPTH               opt_bus_iir_depth
     #define BUS_IIR_PVRED               opt_bus_iir_pvred
     #define BUS_IIR_CUTRED              opt_bus_iir_cutred
     #define BUS_IIR_ALLRED              opt_bus_iir_allred
+    #define BUS_IIR_PV_STABLE           opt_bus_iir_pv_stable
+    #define BUS_IIR_CUT_IMPROVE         opt_bus_iir_cut_improve
+    #define BUS_IIR_ALL_WORSEN          opt_bus_iir_all_worsen
 #else
-    #define BUS_IID_DEPTH_MIN           10
-    #define BUS_IIR_DEPTH               4
-    #define BUS_IIR_PVRED               2
-    #define BUS_IIR_CUTRED              2
-    #define BUS_IIR_ALLRED              0
+    #define BUS_IID_DEPTH_MIN           9
+    #define BUS_IID_IMPROVE             60
+    #define BUS_IID_WORSEN              40
+    #define BUS_IIR_DEPTH               3
+    #define BUS_IIR_PVRED               1
+    #define BUS_IIR_CUTRED              1
+    #define BUS_IIR_ALLRED              1
+    #define BUS_IIR_PV_STABLE           0
+    #define BUS_IIR_CUT_IMPROVE         0
+    #define BUS_IIR_ALL_WORSEN          -1
 #endif
 
 #if (OPTIMIZAR_LMP)
@@ -582,13 +821,23 @@ long long get_time_ms();
     #define BUS_NM_IMP                  opt_bus_nm_imp
     #define BUS_NM_DIV                  opt_bus_nm_div
     #define BUS_NM_VERIF                opt_bus_nm_verif
+    #define BUS_NM_IFWORSEN             opt_bus_nm_ifworsen
+    #define BUS_NM_WILLIMPROVE          opt_bus_nm_willimprove
+    #define BUS_NM_ISSTABLE             opt_bus_nm_isstable
+    #define BUS_NM_WILLWORSEN           opt_bus_nm_willworsen
 #else
     #define BUS_NM_CUTYALL              1
     #define BUS_NM_R                    4
-    #define BUS_NM_IMP                  1
-    #define BUS_NM_DIV                  197
-    #define BUS_NM_VERIF                8
+    #define BUS_NM_IMP                  0
+    #define BUS_NM_DIV                  229
+    #define BUS_NM_VERIF                15
+    #define BUS_NM_IFWORSEN             1
+    #define BUS_NM_WILLIMPROVE          20
+    #define BUS_NM_ISSTABLE             25
+    #define BUS_NM_WILLWORSEN           5
 #endif
+
+#define LMR_MODIF_SCALE                 0
 
 #if (OPTIMIZAR_LMR)
     #define LMR_BASE_DEPTH              opt_lmr_base_depth
@@ -600,36 +849,82 @@ long long get_time_ms();
     #define LMR_EVAL_DEPTH              opt_lmr_eval_depth
     #define LMR_TTD_DEPTH               opt_lmr_ttd_depth
     #define LMR_TTCAPT_DEPTH            opt_lmr_ttcapt_depth
+    #define LMR_TC_WILLIMPROVE          opt_lmr_tc_willimprove
+    #define LMR_TC_WILLWORSEN           opt_lmr_tc_willworsen
+    #define LMR_TC_ISSTABLE             opt_lmr_tc_isstable
+    #define LMR_TC_WLLIMPBETA           opt_lmr_tc_wllimpbeta
+    #define LMR_TC_WILWORALPHA          opt_lmr_tc_wilworalpha
+#else
+    #define LMR_BASE_DEPTH              1
+    #define LMR_BASE_MOVE               4
+    #define LMR_CHECK_DEPTH             -1
+    #define LMR_CUT_DEPTH               5
+    #define LMR_MEJO_DEPTH              -1
+    #define LMR_GOODMOVE_MARGIN         230
+    #define LMR_EVAL_DEPTH              0
+    #define LMR_TTD_DEPTH               -1
+    #define LMR_TTCAPT_DEPTH            1
+    #define LMR_TC_WILLIMPROVE          -1
+    #define LMR_TC_WILLWORSEN           1
+    #define LMR_TC_ISSTABLE             0
+    #define LMR_TC_WLLIMPBETA           -1
+    #define LMR_TC_WILWORALPHA          1
+#endif
+
+#if (OPTIMIZAR_LMR_HIST)
     #define LMR_HIST_MENOS2             opt_lmr_hist_menos2
     #define LMR_HIST_MENOS1             opt_lmr_hist_menos1
     #define LMR_HIST_MAS1               opt_lmr_hist_mas1
     #define LMR_CHIST_MAS1              opt_lmr_chist_mas1
     #define LMR_CHIST_MENOS1            opt_lmr_chist_menos1
 #else
-    #define LMR_BASE_DEPTH              2
-    #define LMR_BASE_MOVE               4
-    #define LMR_CHECK_DEPTH             -3
-    #define LMR_CUT_DEPTH               3
-    #define LMR_MEJO_DEPTH              -3
-    #define LMR_GOODMOVE_MARGIN         230
-    #define LMR_EVAL_DEPTH              4
-    #define LMR_TTD_DEPTH               -1
-    #define LMR_TTCAPT_DEPTH            1
-    #define LMR_HIST_MENOS2             7974
-    #define LMR_HIST_MENOS1             3424
-    #define LMR_HIST_MAS1               -2252
-    #define LMR_CHIST_MAS1              -240
-    #define LMR_CHIST_MENOS1            135
+    #define LMR_HIST_MENOS2             8004
+    #define LMR_HIST_MENOS1             3432
+    #define LMR_HIST_MAS1               -1936
+    #define LMR_CHIST_MAS1              -235
+    #define LMR_CHIST_MENOS1            140
+#endif
+
+// Clasificador tactico en LMR (unidades de 1/3 ply, igual que el resto de LMR)
+#if (OPTIMIZAR_TC)
+    #define TC_THRESHOLD                opt_tc_threshold
+    #define TC_DIR_MIN_DEPTH            opt_tc_dir_min_depth
+#else
+    #define TC_THRESHOLD                82
+    // Profundidad restante minima para hacer caso a la DIRECCION del clasificador
+    // (bWillImprove / bWillWorsen). Medido sobre 2584 posiciones de partida, el
+    // acierto de signo del clasificador cuando algo pasa de verdad (|diff| > 50 cp
+    // a esa misma profundidad) y el clasificador se moja (|dir| > 0.3):
+    //
+    //     prof  1..7   41-45 %   <- por debajo de la moneda, hasta 3.8 sigma
+    //     prof  8..11  47-54 %   <- ruido
+    //     prof 12..15  56-60 %   <- util, hasta 5.1 sigma
+    //
+    // El clasificador predice DONDE ACABA la eval; una busqueda corta todavia va
+    // de camino y a menudo se mueve al reves antes de darse la vuelta. Por eso el
+    // dato esta invertido cerca de las hojas, que es donde estan casi todos los nodos.
+    //
+    // bIsStable (p_estable) NO entra aqui: ese si acierta a todas las profundidades
+    // (separa el error de la eval por un factor 6-12x desde la profundidad 1).
+    //
+    // 0 = comportamiento de siempre (hacer caso a cualquier profundidad).
+    #define TC_DIR_MIN_DEPTH            0
 #endif
 
 #if (OPTIMIZAR_PBCT)
     #define PROBCUT_DEPTH               opt_probcut_depth
     #define PROBCUT_MARGIN              opt_probcut_margin
     #define PROBCUT_REDUCTION           opt_probcut_reduction
+    #define PROBCUT_WILLIMPROVE         opt_probcut_willimprove
+    #define PROBCUT_ISSTABLE            opt_probcut_isstable
+    #define PROBCUT_WILLWORSEN          opt_probcut_willworsen
 #else
-    #define PROBCUT_DEPTH               7
-    #define PROBCUT_MARGIN              100
-    #define PROBCUT_REDUCTION           5
+    #define PROBCUT_DEPTH               4
+    #define PROBCUT_MARGIN              90
+    #define PROBCUT_REDUCTION           6
+    #define PROBCUT_WILLIMPROVE         20
+    #define PROBCUT_ISSTABLE            40
+    #define PROBCUT_WILLWORSEN          5
 #endif
 
 #if (OPTIMIZAR_SE)
@@ -674,5 +969,3 @@ long long get_time_ms();
     #define PODA_HASH_ALFA_MULT_DIF     111
     #define PODA_HASH_ALFA_MULT_PROF    -10
 #endif
-
-#define LMR_MODIF_SCALE             0

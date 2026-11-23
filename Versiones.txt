@@ -1,0 +1,78 @@
+1.01
+* Ajustes control de tiempo para evitar jugadas demasiado rápidas cuando no son obvias
+* LMR base 3 y optimizado
+* Syzygy Root Probe (DTZ)
+
+1.02
+* Full Razoring y optimizado
+
+1.03
+* NM Verif al optimizador -> sigue diciendo 8
+* Separo NM verif para bHayMovTT o !bHayMovTT y optimizador -> no mejora, lo descarto
+* Mejoras en gestión del tiempo. Es el único cambio que queda en esta versión.
+
+2.00
+* Areglo bug en jaque burro
+* Nueva red (las anteriores están defectuosas) -> net5
+* Ligeros ajustes en la gestión del tiempo
+* Deshabilito full razoring
+
+	2.01 fallida
+	* PawnCorrHist
+
+2.01
+* Utilizar eval estática de tabla hash (que no se usaba) y actualizarlo correctamente
+* Ajuste en el cálculo de static eval
+* Optimización QS
+
+2.02
+* Optimización Razoring
+
+3.00
+* Clasificador táctico y recalibrado de parámetros de búsqueda
+
+3.01
+* Optim PRBC
+
+3.10
+* Arreglo see(): fallaba en todo cambio igualado (TxT, CxC, PxP defendidas)
+* Syzygy: el sondeo WDL fallaba por pasar rule50; scores de TB sin ajustar por ply en la TT
+* Reloj a QueryPerformanceCounter (GetTickCount64 saltaba de 15,35 ms)
+* History gravity castigaba jugadas podadas por LMP que nunca se buscaron
+* LMP delante de make_move; el jaque se calcula una sola vez por jugada
+* TT: fail-soft, guarda de la regla de 50, sin duplicados, lockless, sin division, alineada, prefetch
+* Pila de los hilos a 8 MB y SearchData al heap
+* Comando bench y soporte de go nodes
+
+3.11
+* see(): el umbral no alternaba con el bando; se perdian intercambios que acaban justo en el umbral
+* Centinela EVAL_NONE para la eval guardada en la TT (antes -INFINITO, que se solapaba con el jaque)
+* El limitador de extensiones tambien anulaba las negativas
+* is_repetition comprobaba dos veces la raiz y paraba una posicion antes de tiempo
+* engine_set_position ignoraba si make_move fallaba
+* nnue_tc_init ignoraba el resultado de fread: un fichero truncado daba pesos basura
+* Toda la salida no-UCI pasa a info string
+
+3.12 Robusto
+* El Juez: perft y go perft con divide, info con PV desde profundidad 1 e info final con los nodos reales
+* TT: la firma usaba los mismos bits que el indice (13 bits efectivos con 32 MB)
+* Regla de 50: el mate tiene prioridad. Material insuficiente solo en posiciones muertas
+* Reloj: con 50 ms o menos, o con los relojes a 0, no habia limite de tiempo
+* Ponder/infinite: bestmove solo tras stop/ponderhit. Carrera de ponderhit que hacia perder por tiempo
+* Cada linea UCI en una sola escritura: un readyok podia colarse dentro del bestmove
+* UCI robusto: lineas vacias, setoption/position mal formados, jugadas ilegales, coronacion en mayuscula, EOF
+* FEN validado y transaccional: con uno invalido, bestmove 0000. Enroques y casilla al paso saneados
+* EvalFile/TCFile que fallan conservan la red anterior. Las redes se buscan tambien junto al exe
+* Hash: max 16384, se reserva antes de liberar, el bench restaura el tamano configurado
+* Los nodos frontera se contaban dos veces: bench 2.868.744 -> 1.963.950, nps notificados -30 %
+* Casilla al paso en el hash solo si hay captura posible (se perdian repeticiones)
+* Syzygy: WDL en el arbol solo con contador 0 y sin enroques; DTZ tambien en ponder/infinite
+* Ordenacion de jugadas perezosa (+2 % de nps). 'Gilipol bench' por linea de ordenes
+
+3.20
+* Historia de jugadas tranquilas, de capturas y correction history conservadas entre jugadas (antes se borraban en cada busqueda)
+* SPSA de 16.000 partidas con las tablas conservadas: margen de history pruning 0 -> 961, profundidad 9 -> 8, umbrales de LMR por historia
+* SPRT contra 3.12: +46,7 +- 16,4 Elo (794 partidas, 5+0.05)
+* Un solo ejecutable para cualquier CPU: detecta en tiempo de ejecucion AVX-512 / AVX2 / generico, PEXT / magics y POPCNT. Todas las variantes dan el mismo bench
+* Las redes van dentro del ejecutable (EvalFile/TCFile siguen pudiendo cargar otra desde disco)
+* AVX-512 suma la capa de salida en el mismo orden que AVX2: los dos binarios juegan exactamente igual

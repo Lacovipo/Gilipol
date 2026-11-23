@@ -7,6 +7,15 @@
 
  #include "common.h"
 #include "tbprobe.h"
+// Espera de 1 ms (bestmove en infinite/ponder, I08). En la compilacion monohilo
+// no se incluye windows.h; basta con declarar Sleep.
+#if !defined(USE_SMP)
+  #ifdef _WIN32
+    __declspec(dllimport) void __stdcall Sleep(unsigned long ms);
+  #else
+    #include <unistd.h>
+  #endif
+#endif
 
 #ifdef USE_SMP
     #ifdef _WIN32
@@ -17,7 +26,8 @@
     #endif
 #endif
 
-#define MAX_PLY 128
+// Nodos de la ultima busqueda completada (main + helpers). Lo consume 'bench'.
+long long last_search_nodes = 0;
 
 TTCluster* tt_table = NULL;
 uint64_t tt_cluster_count = 0;
@@ -45,6 +55,11 @@ typedef struct
     Move counter_moves[2][64][64];
     int capture_history[12][64][6]; // [Pieza][Casilla][Victima]
 
+    // Correction history: sesgo medio (busqueda - eval estatica) por estructura
+    // de peones. int16_t y no int para que la tabla ocupe 64 KB en vez de 128 y
+    // quepa mejor en cache; con CORR_LIMIT = 8192 sobra rango.
+    int16_t correction_history[2][CORR_SIZE];
+
     // Control de extensiones
     int search_root_depth;
 
@@ -61,12 +76,13 @@ typedef struct
 
 // --- Variables estáticas para control de tiempo interno ---
 // Estas variables son compartidas (escritas por main thread antes de buscar, leídas por todos)
-static long long search_start_time = 0;
-static ATOMIC_LLONG search_time_soft = -1;
-static ATOMIC_LLONG search_time_hard = -1;
+static long long search_start_time = 0;     // lo fija preparar_busqueda() al recibir 'go'
+static SHARED_LLONG search_time_soft = -1;  // compartidas: 'ponderhit' las reescribe desde el hilo UCI
+static SHARED_LLONG search_time_hard = -1;
+static ATOMIC_LLONG search_max_nodes = 0;   // 'go nodes N' (0 = sin límite)
 static SearchLimits current_limits;
-static ATOMIC_BOOL search_flag_infinite = 0;
-static ATOMIC_BOOL search_flag_ponder = 0;
+static SHARED_INT search_flag_infinite = 0;
+static SHARED_INT search_flag_ponder = 0;
 static int previous_search_score = 0;
 
 // --- Variables para heurísticas de tiempo (sólo Main Thread) ---
@@ -98,7 +114,7 @@ int probe_syzygy(const Position* pos, int* score, int ply)
         pos->pieces[WHITE][BISHOP] | pos->pieces[BLACK][BISHOP],
         pos->pieces[WHITE][KNIGHT] | pos->pieces[BLACK][KNIGHT],
         pos->pieces[WHITE][PAWN] | pos->pieces[BLACK][PAWN],
-        opt_syzygy_50move_rule ? pos->half_move_clock : 0,
+        0,
         castling, ep, pos->side_to_move == WHITE
     );
 
@@ -147,21 +163,47 @@ void resize_tt(int mb)
     if (mb > 16384)
         mb = 16384;
 
-    if (tt_table)
-        free(tt_table);
-
-    // Calcular clusters: cada cluster = 64 bytes
-    long long bytes = (long long)mb * 1024LL * 1024LL;
-    tt_cluster_count = bytes / sizeof(TTCluster);
-
-    tt_table = (TTCluster*)malloc(tt_cluster_count * sizeof(TTCluster));
-
-    if (!tt_table)
+    // Alineada a 64 bytes: un TTCluster mide exactamente una linea de cache, y con
+    // malloc (16 bytes de alineacion en Windows) la mitad de los clusters cruzarian
+    // dos lineas, duplicando los fallos de cache en cada sondeo.
+    //
+    // Antes se liberaba la tabla vieja y, si la reserva nueva fallaba, se jugaba sin TT
+    // (B17). Ahora: 1) se reserva la nueva sin soltar la vieja; 2) si no cabe, se suelta
+    // la vieja y se reintenta; 3) si sigue sin caber, se prueba con la mitad.
+    const int mb_pedidos = mb;
+    uint64_t clusters = ((uint64_t)mb << 20) / sizeof(TTCluster);
+    TTCluster* nueva = (TTCluster*)_mm_malloc(clusters * sizeof(TTCluster), 64);
+    if (!nueva && tt_table)
     {
-        printf("info string Error: No se pudo asignar %d MB para la tabla hash\n", mb);
+        _mm_free(tt_table);
+        tt_table = NULL;
+        tt_cluster_count = 0;
+        nueva = (TTCluster*)_mm_malloc(clusters * sizeof(TTCluster), 64);
+    }
+    while (!nueva && mb > 1)
+    {
+        mb /= 2;
+        clusters = ((uint64_t)mb << 20) / sizeof(TTCluster);
+        nueva = (TTCluster*)_mm_malloc(clusters * sizeof(TTCluster), 64);
+    }
+    if (!nueva)
+    {
+        if (tt_table)
+        {
+            printf("info string Error: No se pudo asignar la tabla hash (%d MB); se mantiene la anterior\n", mb_pedidos);
+            return;
+        }
+        printf("info string Error: No se pudo asignar ninguna tabla hash: se juega SIN TT\n");
         tt_cluster_count = 0;
         return;
     }
+    if (mb != mb_pedidos)
+        printf("info string Aviso: no caben %d MB de hash; se usan %d MB\n", mb_pedidos, mb);
+
+    if (tt_table)
+        _mm_free(tt_table);
+    tt_table = nueva;
+    tt_cluster_count = clusters;
 
     clear_tt();
     printf("info string Hash inicializada: %d MB (%llu clusters)\n", mb, (unsigned long long)tt_cluster_count);
@@ -183,38 +225,102 @@ void tt_new_search()
     // Wraparound cada 256 búsquedas (no hay problema, el aging sigue funcionando)
 }
 
-// Ajustar puntuación de mate para guardar en TT
+// Indice de cluster sin division.
+//
+// 'hash %% tt_cluster_count' es una division entera de 64 bits: 20-40 ciclos en
+// CADA sondeo. El truco de Lemire (multiplicar y quedarse con la parte alta)
+// reparte igual de bien y cuesta una multiplicacion.
+static inline uint64_t tt_indice(uint64_t hash)
+{
+    return (uint64_t)(((__uint128_t)hash * (__uint128_t)tt_cluster_count) >> 64);
+}
+
+// --- Hash sin bloqueo (lockless) ---
+//
+// Sólo hash_key es atómica; el resto de la entrada no lo es. En SMP un lector
+// puede ver una entrada a medio escribir (score de una posición con la profundidad
+// de otra) y cortar con un valor falso, o devolver un best_move ilegal.
+//
+// Solución estándar: guardar la clave XOR un resumen del resto de los campos. Si
+// la entrada se lee desgarrada, el resumen no cuadra y se descarta. En monohilo
+// el valor da la vuelta exacta, así que no cambia nada.
+static inline uint32_t tt_resumen(Move best_move, int16_t score, int16_t eval,
+                                  uint8_t depth, uint8_t flag)
+{
+    return (uint32_t)best_move
+         ^ ((uint32_t)(uint16_t)score << 3)
+         ^ ((uint32_t)(uint16_t)eval  << 7)
+         ^ ((uint32_t)depth << 19)
+         ^ ((uint32_t)flag  << 27);
+}
+
+static inline uint32_t tt_resumen_de(const TTEntry* e)
+{
+    return tt_resumen(e->best_move, e->score, e->eval, e->depth, e->flag);
+}
+
+// Índice de cluster y prefetch. Se llama nada más generar el hash del hijo para
+// que la línea de cache esté en camino cuando el nodo hijo sondee la TT.
+void tt_prefetch(uint64_t hash)
+{
+    if (tt_table && tt_cluster_count)
+        __builtin_prefetch(&tt_table[tt_indice(hash)]);
+}
+
+// Ajustar puntuación de mate o de tablebase para guardar en TT.
+// El score que llega es relativo al nodo actual ("mate en N desde aquí"); en la
+// TT hay que dejarlo relativo a la raíz, porque la misma entrada se leerá desde
+// plies distintos.
+// OJO: el umbral es TB_BOUND, no MATE_BOUND. Los scores de Syzygy valen
+// ±(TB_MAX - ply) y también dependen del ply; con MATE_BOUND se guardaban en
+// crudo y se corrompían al releerse desde otra profundidad.
 static inline int16_t score_to_tt(int score, int ply)
 {
-    if (score >= MATE_BOUND)
+    if (score >= TB_BOUND)
         return (int16_t)(score + ply);
-    if (score <= -MATE_BOUND)
+    if (score <= -TB_BOUND)
         return (int16_t)(score - ply);
     return (int16_t)score;
 }
 
-// Recuperar puntuación de mate desde TT
+// Recuperar puntuación de mate o de tablebase desde TT (inversa de score_to_tt)
 static inline int score_from_tt(int16_t score, int ply)
 {
-    // Convertir a int para comparación correcta con MATE_BOUND
+    // Convertir a int para comparación correcta con TB_BOUND
     int s = (int)score;
-    if (s >= MATE_BOUND)
+    if (s >= TB_BOUND)
         return s - ply;
-    if (s <= -MATE_BOUND)
+    if (s <= -TB_BOUND)
         return s + ply;
     return s;
 }
 
-static void print_score(int score)
+static void score_a_texto(int score, char* out, size_t tam)
 {
     if (abs(score) > MATE_BOUND)
     {
         int moves = (MATE_SCORE - abs(score) + 1) / 2;
-        printf("mate %d", score > 0 ? moves : -moves);
+        snprintf(out, tam, "mate %d", score > 0 ? moves : -moves);
     }
     else
     {
-        printf("cp %d", score);
+        snprintf(out, tam, "cp %d", score);
+    }
+}
+
+// PV terminada en MOVE_NONE, separada por espacios
+static void pv_a_texto(const Move* pv, char* out, size_t tam)
+{
+    size_t n = 0;
+    out[0] = 0;
+    for (int j = 0; j < MAX_PLY && pv[j] != MOVE_NONE; j++)
+    {
+        char m[8];
+        move_to_str(pv[j], m);
+        const int w = snprintf(out + n, tam - n, "%s%s", j ? " " : "", m);
+        if (w < 0 || (size_t)w >= tam - n)
+            break;
+        n += (size_t)w;
     }
 }
 
@@ -224,16 +330,18 @@ static void print_score(int score)
  * 
  */
 // tt_eval: eval estática pura guardada en TT (salida NNUE de una búsqueda anterior).
-//          Se inicializa a -INFINITO; se rellena si hay hit, independientemente de si hay cutoff.
+//          Se inicializa a EVAL_NONE; se rellena si hay hit, independientemente de si hay cutoff.
 //          Permite evitar llamadas a nnue_evaluate() en visitas repetidas a la misma posición.
 int read_tt(uint64_t hash, int depth, int ply, int alpha, int beta, int* score, Move* best_move, int* tt_depth, int* tt_flag, int* tt_eval)
 {
     if (!tt_table || tt_cluster_count == 0)
         return 0;
 
-    uint64_t cluster_idx = hash % tt_cluster_count;
+    uint64_t cluster_idx = tt_indice(hash);
     TTCluster* cluster = &tt_table[cluster_idx];
-    uint32_t hash_key = (uint32_t)(hash >> 32);
+    // Firma con los 32 bits BAJOS: tt_indice() usa los ALTOS (Lemire), y si la firma
+    // tambien los usara, los bits del indice no aportarian identidad (I04).
+    uint32_t hash_key = (uint32_t)hash;
 
     // Inicialización
     *best_move = MOVE_NONE;
@@ -242,7 +350,7 @@ int read_tt(uint64_t hash, int depth, int ply, int alpha, int beta, int* score, 
     if (tt_flag)
         *tt_flag = 0;
     if (tt_eval)
-        *tt_eval = -INFINITO;  // Centinela: sin eval válida hasta que encontremos la entrada
+        *tt_eval = EVAL_NONE;  // Centinela: sin eval válida hasta que encontremos la entrada
 
     // Buscar en las 4 ranuras
     TTEntry* found_entry = NULL;
@@ -250,8 +358,12 @@ int read_tt(uint64_t hash, int depth, int ply, int alpha, int beta, int* score, 
     {
         TTEntry* entry = &cluster->entries[i];
 
-        // Lectura de la clave (atómica con acquire en SMP, directa en single-thread)
-        if (ATOMIC_LOAD_ACQ(entry->hash_key) == hash_key)
+        // Lectura de la clave (atómica con acquire en SMP, directa en single-thread).
+        // La clave guardada lleva XOR con el resumen del resto de la entrada: si se
+        // leyó desgarrada, no cuadra y la descartamos.
+        // depth == 0: ranura nunca escrita (toda entrada real tiene depth >= 1). Sin la
+        // guarda, una clave con los 32 bits bajos a 0 casaba con una ranura vacia (B26).
+        if (entry->depth != 0 && (ATOMIC_LOAD_ACQ(entry->hash_key) ^ tt_resumen_de(entry)) == hash_key)
         {
             // Priorizar la entrada más profunda si hay múltiples
             if (!found_entry || entry->depth > found_entry->depth)
@@ -270,8 +382,8 @@ int read_tt(uint64_t hash, int depth, int ply, int alpha, int beta, int* score, 
         *tt_flag = found_entry->flag;
 
     // Devolver la eval estática guardada (para evitar llamada a NNUE).
-    // Nota: write_tt solo guarda valores en rango normal [±TB_MAX]; -INFINITO nunca
-    // aparece aquí salvo como centinela de no-encontrado (ver inicialización arriba).
+    // OJO: cuando el nodo estaba en jaque no hay eval estática y se guardó EVAL_NONE.
+    // El llamante lo distingue comparando contra EVAL_NONE.
     if (tt_eval && found_entry->depth > 0)
         *tt_eval = (int)found_entry->eval;
 
@@ -284,21 +396,18 @@ int read_tt(uint64_t hash, int depth, int ply, int alpha, int beta, int* score, 
     if (found_entry->depth < depth)
         return 0;
 
-    // Verificar si podemos hacer cutoff según el tipo de bound
+    // Verificar si podemos hacer cutoff según el tipo de bound.
+    //
+    // OJO: *score se queda con tt_val en todos los casos. Antes se sobreescribia con
+    // alpha o beta (fail-hard), lo que tiraba informacion en un motor que por lo demas
+    // es fail-soft, y en la raiz llegaba a meter los limites de la ventana de
+    // aspiracion dentro de static_eval.
     if (found_entry->flag == TT_EXACT)
         return 1;
     else if (found_entry->flag == TT_ALPHA && tt_val <= alpha)
-    {
-        if (score)
-            *score = alpha;
         return 1;
-    }
     else if (found_entry->flag == TT_BETA && tt_val >= beta)
-    {
-        if (score)
-            *score = beta;
         return 1;
-    }
 
     // No cutoff pero movimiento disponible
     return 0;
@@ -314,31 +423,39 @@ void write_tt(uint64_t hash, int depth, int ply, int score, int flag, Move best_
     if (!tt_table || tt_cluster_count == 0)
         return;
 
-    uint64_t cluster_idx = hash % tt_cluster_count;
+    uint64_t cluster_idx = tt_indice(hash);
     TTCluster* cluster = &tt_table[cluster_idx];
-    uint32_t hash_key = (uint32_t)(hash >> 32);
+    // Firma con los 32 bits BAJOS: tt_indice() usa los ALTOS (Lemire), y si la firma
+    // tambien los usara, los bits del indice no aportarian identidad (I04).
+    uint32_t hash_key = (uint32_t)hash;
 
     TTEntry* replace_entry = NULL;
     int replace_idx = -1;
     int worst_score = -1000000;
 
-    // 
-    // Buscar si ya existe esta posición o una ranura vacía
-    // 
+    //
+    // Buscar si ya existe esta posición o una ranura vacía.
+    //
+    // OJO: hay que barrer TODAS las ranuras buscando la misma posición ANTES de
+    // quedarse con una vacía. Antes se cortaba en la primera vacía, así que si la
+    // ranura 0 estaba libre y la 1 tenía esta misma posición, se guardaba dos veces.
+    //
+    TTEntry* ranura_vacia = NULL;
+
     for (int i = 0; i < TT_CLUSTER_SIZE; i++)
     {
         TTEntry* entry = &cluster->entries[i];
 
-        // Ranura vacía (nunca usada)
-        if (ATOMIC_LOAD(entry->hash_key) == 0)
+        // Ranura vacía (nunca usada): la recordamos, pero seguimos buscando
+        if (ATOMIC_LOAD(entry->hash_key) == 0 && entry->depth == 0)
         {
-            replace_entry = entry;
-            replace_idx = i;
-            break;
+            if (!ranura_vacia)
+                ranura_vacia = entry;
+            continue;
         }
 
         // Misma posición - siempre reemplazar si es más profunda o misma generación
-        if (ATOMIC_LOAD(entry->hash_key) == hash_key)
+        if ((ATOMIC_LOAD(entry->hash_key) ^ tt_resumen_de(entry)) == hash_key)
         {
             // Always replace si:
             // - Es la misma generación (búsqueda actual)
@@ -358,6 +475,15 @@ void write_tt(uint64_t hash, int depth, int ply, int score, int flag, Move best_
                 return;
             }
         }
+    }
+
+    //
+    // Si no está ya guardada, usar la ranura vacía si la hubo
+    //
+    if (replace_entry == NULL && ranura_vacia != NULL)
+    {
+        replace_entry = ranura_vacia;
+        replace_idx = 0;
     }
 
     //
@@ -407,8 +533,11 @@ void write_tt(uint64_t hash, int depth, int ply, int score, int flag, Move best_
         replace_entry->depth = (uint8_t)depth;
         replace_entry->generation = tt_generation;
         replace_entry->flag = (uint8_t)flag;
-        // Escribir clave al final (con release en SMP para publicar datos de forma segura)
-        ATOMIC_STORE_REL(replace_entry->hash_key, hash_key);
+        // Escribir la clave al final, con XOR del resumen (ver tt_resumen).
+        // En SMP el release publica los datos anteriores de forma segura.
+        ATOMIC_STORE_REL(replace_entry->hash_key,
+                         hash_key ^ tt_resumen(best_move, score_to_tt(score, ply),
+                                               (int16_t)static_eval, (uint8_t)depth, (uint8_t)flag));
     }
 }
 
@@ -452,10 +581,57 @@ static void clear_continuation_history(void)
     memset(continuation_history, 0, sizeof(continuation_history));
 }
 
+// Datos por hilo persistentes entre busquedas: la posicion 0 es el hilo principal y
+// las siguientes los helpers. Antes se pedian con malloc en cada 'go' y se liberaban
+// al acabar, de modo que history, capturas, contrajugadas, killers y corrhist nacian
+// vacias en cada jugada. Ahora viven toda la partida y las borra clear_search_heuristics.
+static SearchData* sd_pool   = NULL;
+static int         sd_pool_n = 0;
+
+// Garantiza al menos n entradas; las nuevas nacen a cero. NULL si no hay memoria.
+static SearchData* obtener_sd_pool(int n)
+{
+    if (n > sd_pool_n)
+    {
+        SearchData* nuevo = (SearchData*)realloc(sd_pool, (size_t)n * sizeof(SearchData));
+        if (!nuevo)
+            return NULL;
+        memset(nuevo + sd_pool_n, 0, (size_t)(n - sd_pool_n) * sizeof(SearchData));
+        sd_pool   = nuevo;
+        sd_pool_n = n;
+    }
+    return sd_pool;
+}
+
+// Al empezar cada busqueda: borra o conserva cada tabla segun CONSERVA_*.
+static void preparar_heuristicas(SearchData* sd)
+{
+#if (CONSERVA_KILLERS)
+    memmove(&sd->killer_moves[0], &sd->killer_moves[2], (MAX_PLY - 2) * sizeof(sd->killer_moves[0]));
+    memset(&sd->killer_moves[MAX_PLY - 2], 0, 2 * sizeof(sd->killer_moves[0]));
+#else
+    memset(sd->killer_moves, 0, sizeof(sd->killer_moves));
+#endif
+#if (!CONSERVA_HISTORIA)
+    memset(sd->history_moves, 0, sizeof(sd->history_moves));
+#endif
+#if (!CONSERVA_CONTRAJUGADAS)
+    memset(sd->counter_moves, 0, sizeof(sd->counter_moves));
+#endif
+#if (!CONSERVA_CAPTURAS)
+    memset(sd->capture_history, 0, sizeof(sd->capture_history));
+#endif
+#if (!CONSERVA_CORRHIST)
+    memset(sd->correction_history, 0, sizeof(sd->correction_history));
+#endif
+}
+
 // Función pública para limpiar todas las heurísticas de búsqueda
 void clear_search_heuristics(void)
 {
     clear_continuation_history();
+    if (sd_pool)
+        memset(sd_pool, 0, (size_t)sd_pool_n * sizeof(SearchData));
     previous_search_score = 0;
 }
 
@@ -605,6 +781,35 @@ int score_move(Move move, Move tt_move, int ply, Move prev_move, const Position*
  * Ordenar movimientos (Selection Sort simple para listas pequeñas)
  *
  */
+// Puntua sin ordenar. El bucle de jugadas escoge con pick_move(): hace en el
+// momento el mismo intercambio que haria la ordenacion completa, asi que el orden
+// es identico y no se paga por ordenar jugadas que un corte nunca llega a ver (I47).
+static inline void score_moves(const MoveList* list, int* scores, Move tt_move, int ply, Move prev_move, const Position* pos, SearchData* sd)
+{
+    for (int i = 0; i < list->count; i++)
+        scores[i] = score_move(list->moves[i], tt_move, ply, prev_move, pos, sd);
+}
+
+static inline void pick_move(MoveList* list, int* scores, int i)
+{
+    int best_idx = i;
+    for (int j = i + 1; j < list->count; j++)
+    {
+        if (scores[j] > scores[best_idx])
+            best_idx = j;
+    }
+    if (best_idx != i)
+    {
+        Move temp_move = list->moves[i];
+        list->moves[i] = list->moves[best_idx];
+        list->moves[best_idx] = temp_move;
+
+        int temp_score = scores[i];
+        scores[i] = scores[best_idx];
+        scores[best_idx] = temp_score;
+    }
+}
+
 void sort_moves(MoveList* list, Move tt_move, int ply, Move prev_move, const Position* pos, SearchData* sd)
 {
     int scores[256];
@@ -633,12 +838,43 @@ void sort_moves(MoveList* list, Move tt_move, int ply, Move prev_move, const Pos
     }
 }
 
-/*
- *
+// --- Correction history ---
+
+// Sesgo aprendido para esta estructura de peones, en centipeones.
+static inline int correccion_eval(const Position* pos, const SearchData* sd)
+{
+#if (USA_CORRHIST)
+    const int cv = sd->correction_history[pos->side_to_move][pos->pawn_hash & (CORR_SIZE - 1)];
+    return cv / CORR_GRAIN;
+#else
+    (void)pos; (void)sd;
+    return 0;
+#endif
+}
+
+// Media movil ponderada por profundidad: cuanto mas honda la busqueda que produjo
+// la diferencia, mas peso se le da.
+static inline void actualizar_correccion(const Position* pos, SearchData* sd, int diff, int depth)
+{
+#if (USA_CORRHIST)
+    int16_t* entrada = &sd->correction_history[pos->side_to_move][pos->pawn_hash & (CORR_SIZE - 1)];
+    const int peso = min(depth + 1, CORR_PESO);
+    const int v = ((int)(*entrada) * (256 - peso) + diff * CORR_GRAIN * peso) / 256;
+    *entrada = (int16_t)clamp_int(v, -CORR_LIMIT, CORR_LIMIT);
+#else
+    (void)pos; (void)sd; (void)diff; (void)depth;
+#endif
+}
+
+/* *
  * quiescence
  * 
  */
-int quiescence(Position* pos, int alpha, int beta, int ply, SearchData* sd)
+// nodo_nuevo = false cuando negamax llama a qsearch para el MISMO nodo (profundidad
+// agotada, IIR, razoring): negamax ya lo ha contado y ya ha mirado el limite de nodos y
+// el reloj. Antes se contaba dos veces: nodos y nps salian inflados, y 'go nodes N'
+// visitaba menos posiciones de las N pedidas (B27).
+int quiescence(Position* pos, int alpha, int beta, int ply, SearchData* sd, bool nodo_nuevo)
 {
     //
     // Salida inmediata si se ha detenido la búsqueda
@@ -646,24 +882,37 @@ int quiescence(Position* pos, int alpha, int beta, int ply, SearchData* sd)
     if (ATOMIC_LOAD(stop_search))
         return 0;
 
-    //
-    // Profundidad selectiva y nodos
-    //
-    if (ply > sd->sel_depth)
-        sd->sel_depth = ply;
-    ATOMIC_FETCH_ADD(sd->nodes, 1);
-
-    //
-    // Comprobación de tiempo cada 4096 nodos (pero NO interrumpir depth 1)
-    //
-    if (sd->thread_id == 0 && (ATOMIC_LOAD(sd->nodes) & 4095) == 0)
+    if (nodo_nuevo)
     {
-        long long hard_limit = ATOMIC_LOAD(search_time_hard);
-        // Comprobar si se acabó el tiempo asignado
-        if (hard_limit > 0 && ply > 0 && (get_time_ms() - search_start_time >= hard_limit))
+        //
+        // Profundidad selectiva y nodos
+        //
+        if (ply > sd->sel_depth)
+            sd->sel_depth = ply;
+        ATOMIC_FETCH_ADD(sd->nodes, 1);
+
+        // Límite de nodos ('go nodes N'). Se comprueba en cada nodo, no cada 4096 como
+        // el tiempo: el sentido de este límite es ser exacto y reproducible entre
+        // máquinas. Con el límite a 0 es una comparación contra una constante caliente.
+        const long long tope_nodos = ATOMIC_LOAD(search_max_nodes);
+        if (tope_nodos > 0 && ply > 0 && ATOMIC_LOAD(sd->nodes) >= tope_nodos)
         {
             ATOMIC_STORE(stop_search, 1);
             return 0;
+        }
+
+        //
+        // Comprobación de tiempo cada 4096 nodos (pero NO interrumpir depth 1)
+        //
+        if (sd->thread_id == 0 && (ATOMIC_LOAD(sd->nodes) & 4095) == 0)
+        {
+            long long hard_limit = ATOMIC_LOAD(search_time_hard);
+            // Comprobar si se acabó el tiempo asignado
+            if (hard_limit > 0 && ply > 0 && (get_time_ms() - search_start_time >= hard_limit))
+            {
+                ATOMIC_STORE(stop_search, 1);
+                return 0;
+            }
         }
     }
 
@@ -685,8 +934,9 @@ int quiescence(Position* pos, int alpha, int beta, int ply, SearchData* sd)
     Move tt_move = MOVE_NONE;
     int tt_depth = 0;
     int tt_flag = 0;
-    int tt_eval = -INFINITO;   // eval estática guardada en TT (−INFINITO = sin dato válido)
-    if (read_tt(pos->hash, 0, ply, alpha, beta, &tt_score, &tt_move, &tt_depth, &tt_flag, &tt_eval))
+    int tt_eval = EVAL_NONE;   // eval estática guardada en TT (EVAL_NONE = sin dato válido)
+    if (read_tt(pos->hash, 0, ply, alpha, beta, &tt_score, &tt_move, &tt_depth, &tt_flag, &tt_eval)
+        && pos->half_move_clock < 90)   // ver 1.7c: el hash no incluye el contador de 50
         return tt_score;
     const bool bHayScoreTT = (tt_depth > 0); // Usamos depth > 0 para detectar entrada válida, incluso sin movimiento (común en TT_ALPHA)
 
@@ -708,15 +958,20 @@ int quiescence(Position* pos, int alpha, int beta, int ply, SearchData* sd)
     // tt_eval es la salida pura de NNUE guardada en una búsqueda anterior → igual de válida.
     //
     int stand_pat = -INFINITO;
+    const bool bRecuperarEvalTT = (bHayScoreTT && tt_eval != EVAL_NONE);
     if (!in_check)
     {
         // Usar tt_eval si está disponible; aplicar ajuste de 50 jugadas sobre raw_eval.
-        int qs_raw = (bHayScoreTT && tt_eval != -INFINITO) ? tt_eval : nnue_evaluate(pos);
+        int qs_raw = bRecuperarEvalTT ? tt_eval : nnue_evaluate_tc(pos, QS_USA_TC);
         stand_pat = qs_raw * (200 - pos->half_move_clock) / 200;
+        stand_pat += correccion_eval(pos, sd);
+        stand_pat = clamp_int(stand_pat, -EVAL_MAX, EVAL_MAX);   // la correccion no la mete en zona TB
 
         // Si tenemos un lower bound de la TT (TT_BETA) que es mayor que la evaluación estática,
         // lo usamos para mejorar la precisión de stand_pat.
-        if (bHayScoreTT && (tt_flag == TT_BETA) && tt_score > stand_pat)
+        // Con hmc >= 90 no: el hash no incluye el contador de 50 (ver 1.7c), y este ajuste
+        // daba el mismo corte que la guarda de arriba acababa de negar (B6).
+        if (bHayScoreTT && (tt_flag == TT_BETA) && tt_score > stand_pat && pos->half_move_clock < 90)
             stand_pat = tt_score;
 
         if (stand_pat >= beta)
@@ -724,6 +979,38 @@ int quiescence(Position* pos, int alpha, int beta, int ply, SearchData* sd)
         if (alpha < stand_pat)
             alpha = stand_pat;
     }
+
+    //
+    // Clasificador tactico (WillImprove / WillWorsen / IsStable)
+    //
+    bool bWillImprove = false;
+    bool bWillWorsen  = false;
+    bool bIsStable    = false;
+    if (USA_TC && QS_USA_TC && tc_initialized && !in_check && !bRecuperarEvalTT)
+    {
+        TacticalClass tc = nnue_get_tc();
+        int thr = TC_THRESHOLD;
+        // El clasificador usa perspectiva de blancas (igual que h4[]).
+        // Si juegan negras, mejora para blancas = empeora para el jugador.
+        bool tc_mejora  = ((int)(tc.p_mejora  * 100) >= thr);
+        bool tc_empeora = ((int)(tc.p_empeora * 100) >= thr);
+        bIsStable       = ((int)(tc.p_estable * 100) >= thr);
+        if (pos->side_to_move == WHITE)
+        {
+            bWillImprove = tc_mejora;
+            bWillWorsen  = tc_empeora;
+        }
+        else
+        {
+            bWillImprove = tc_empeora;
+            bWillWorsen  = tc_mejora;
+        }
+    }
+    // Poda muy bestia por clasificador táctico
+    #if(0)
+    if (bWillWorsen)
+        return(alpha);  // No me puedo comer un mate en contra porque si estuviese en jaque las tres variables del TC serían false
+    #endif
 
     //
     // Poda delta mejorada
@@ -738,7 +1025,8 @@ int quiescence(Position* pos, int alpha, int beta, int ply, SearchData* sd)
             max_val = piece_value[ROOK];
         else if (pos->pieces[enemy][BISHOP] | pos->pieces[enemy][KNIGHT])
             max_val = piece_value[BISHOP];
-        if (stand_pat + max_val + QS_PODA_DELTA < alpha)
+        int margin = max_val + QS_PODA_DELTA + bWillImprove * QS_IMPROVE + bIsStable * QS_STABLE + bWillWorsen * QS_WORSEN;
+        if (stand_pat + margin < alpha)
             return(alpha);
     }
 
@@ -747,12 +1035,14 @@ int quiescence(Position* pos, int alpha, int beta, int ply, SearchData* sd)
     //
     MoveList moves;
     generate_captures(pos, &moves);
-    sort_moves(&moves, tt_move, 0, MOVE_NONE, pos, sd);
+    int qs_scores[256];
+    score_moves(&moves, qs_scores, tt_move, 0, MOVE_NONE, pos, sd);
     
     int legal_moves = 0;
     Position child;
     for (int i = 0; i < moves.count; i++)
     {
+        pick_move(&moves, qs_scores, i);
         Move move = moves.moves[i];
 
         //
@@ -776,9 +1066,12 @@ int quiescence(Position* pos, int alpha, int beta, int ply, SearchData* sd)
         copy_position(&child, pos);
         if (!make_move(&child, move))
             continue;
+
+        tt_prefetch(child.hash);
         
         legal_moves++;
-        int score = -quiescence(&child, -beta, -alpha, ply + 1, sd);
+        child.prev = pos;   // la cadena prev no debe saltarse los plies de qsearch (I31)
+        int score = -quiescence(&child, -beta, -alpha, ply + 1, sd, true);
         if (ATOMIC_LOAD(stop_search))
             return 0;
 
@@ -797,6 +1090,21 @@ int quiescence(Position* pos, int alpha, int beta, int ply, SearchData* sd)
     return alpha;
 }
 
+// Hay al menos una jugada legal? (solo se usa con la regla de 50 y en jaque)
+static __attribute__((noinline, cold)) bool hay_jugada_legal(const Position* pos)
+{
+    MoveList lista;
+    generate_moves(pos, &lista, GEN_ALL);
+    Position hijo;
+    for (int i = 0; i < lista.count; i++)
+    {
+        copy_position(&hijo, pos);
+        if (make_move(&hijo, lista.moves[i]))
+            return true;
+    }
+    return false;
+}
+
 // Detectar material insuficiente para dar mate
 static int is_insufficient_material(const Position* pos)
 {
@@ -804,13 +1112,24 @@ static int is_insufficient_material(const Position* pos)
     if (pos->pieces[WHITE][PAWN] | pos->pieces[BLACK][PAWN] | pos->pieces[WHITE][ROOK] | pos->pieces[BLACK][ROOK] | pos->pieces[WHITE][QUEEN] | pos->pieces[BLACK][QUEEN])
         return 0;
 
-    // Contar piezas menores
-    int w_minors = count_bits(pos->pieces[WHITE][KNIGHT] | pos->pieces[WHITE][BISHOP]);
-    int b_minors = count_bits(pos->pieces[BLACK][KNIGHT] | pos->pieces[BLACK][BISHOP]);
+    // Solo posiciones MUERTAS (sin ninguna secuencia legal que acabe en mate):
+    // K-K, K+menor contra K, y K+A contra K+A con alfiles del mismo color.
+    // Menor contra menor en general NO es muerta: hay mates legales (I03).
+    const int w_minors = count_bits(pos->pieces[WHITE][KNIGHT] | pos->pieces[WHITE][BISHOP]);
+    const int b_minors = count_bits(pos->pieces[BLACK][KNIGHT] | pos->pieces[BLACK][BISHOP]);
 
-    // Tablas si ambos bandos tienen 1 o menos piezas menores (K, K+N, K+B vs K, K+N, K+B)
-    if (w_minors <= 1 && b_minors <= 1)
+    if (w_minors + b_minors <= 1)
         return 1;
+
+    if (w_minors == 1 && b_minors == 1
+        && !(pos->pieces[WHITE][KNIGHT] | pos->pieces[BLACK][KNIGHT]))
+    {
+        const uint64_t CASILLAS_CLARAS = 0x55AA55AA55AA55AAULL;
+        const bool w_claro = (pos->pieces[WHITE][BISHOP] & CASILLAS_CLARAS) != 0;
+        const bool b_claro = (pos->pieces[BLACK][BISHOP] & CASILLAS_CLARAS) != 0;
+        if (w_claro == b_claro)
+            return 1;
+    }
 
     return 0;
 }
@@ -842,6 +1161,17 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
     const bool bEsPV = (beta > alpha + 1);
     const int original_alpha = alpha;
 
+    // La PV se vacia LO PRIMERO, antes de cualquier salida anticipada.
+    //
+    // Antes se hacia mas abajo, despues de ocho returns: parada por tiempo o por
+    // nodos, limite de ply, poda por distancia a mate, tablas por repeticion o por
+    // regla de 50, y los tres de Syzygy. Al salir por cualquiera de ellos el buffer
+    // del hijo se quedaba con la PV del hermano anterior, y el padre la copiaba tal
+    // cual: de ahi las 22.338 quejas de "Illegal PV move" en un match de 5000
+    // partidas. No afectaba a la jugada elegida (pv[0] siempre es legal), pero si
+    // a la linea mostrada y a la jugada de ponder.
+    pv[0] = MOVE_NONE;
+
     //
     // Salida inmediata si se ha detenido la búsqueda
     //
@@ -863,6 +1193,18 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
     if (ply > sd->sel_depth)
         sd->sel_depth = ply;
     ATOMIC_FETCH_ADD(sd->nodes, 1);
+
+    // Límite de nodos ('go nodes N'). Se comprueba en cada nodo, no cada 4096 como
+    // el tiempo: el sentido de este límite es ser exacto y reproducible entre
+    // máquinas. Con el límite a 0 es una comparación contra una constante caliente.
+    {
+        const long long tope_nodos = ATOMIC_LOAD(search_max_nodes);
+        if (tope_nodos > 0 && ply > 0 && ATOMIC_LOAD(sd->nodes) >= tope_nodos)
+        {
+            ATOMIC_STORE(stop_search, 1);
+            return 0;
+        }
+    }
 
     //
     // Comprobación de tiempo cada 4095 nodos
@@ -892,8 +1234,18 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
     //
     // Comprobar tablas: 50 movimientos, material insuficiente o repetición
     //
-    if (ply > 0 && (pos->half_move_clock >= 100 || is_insufficient_material(pos) || is_repetition(pos)))
+    if (ply > 0 && (is_insufficient_material(pos) || is_repetition(pos)))
         return 0;
+
+    // Regla de 50: el mate tiene prioridad (FIDE 9.3). Solo hace falta mirarlo si el
+    // bando al turno esta en jaque; si no, son tablas sin mas (I02).
+    if (ply > 0 && pos->half_move_clock >= 100)
+    {
+        if (!is_square_attacked(pos, get_lsb_index(pos->pieces[pos->side_to_move][KING]), pos->side_to_move ^ 1)
+            || hay_jugada_legal(pos))
+            return 0;
+        return -MATE_SCORE + ply;
+    }
 
     //
     // Syzygy Probing (WDL)
@@ -902,6 +1254,8 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
         && !ATOMIC_LOAD(stop_search)
         && excluded_move == MOVE_NONE
         && depth >= opt_syzygy_probe_depth
+        && pos->half_move_clock == 0        // la WDL solo es exacta tras una jugada que pone el
+        && pos->castling_rights == 0        // contador a 0, y sin enroques (como Stockfish; B9)
         && count_bits(pos->all) <= opt_syzygy_probe_limit)
     {
         int tb_score;
@@ -915,13 +1269,12 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
         }
     }
 
-    pv[0] = MOVE_NONE;
 
     //
     // Salida por profundidad agotada
     //
     if (depth <= 0)
-        return quiescence(pos, alpha, beta, ply, sd);
+        return quiescence(pos, alpha, beta, ply, sd, false);
 
 	//
 	// Consultar tabla hash
@@ -930,13 +1283,17 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
     Move tt_move = MOVE_NONE;
     int tt_depth = 0;
     int tt_flag = 0;
-    int tt_eval = -INFINITO;   // eval estática guardada en TT (−INFINITO = sin dato válido)
+    int tt_eval = EVAL_NONE;   // eval estática guardada en TT (EVAL_NONE = sin dato válido)
     if (excluded_move == MOVE_NONE)
     {
-        if (ply == 0) // en la raíz, consultamos pero no cortamos
-            read_tt(pos->hash, depth, ply, alpha, beta, &tt_score, &tt_move, &tt_depth, &tt_flag, &tt_eval);
-        else if (read_tt(pos->hash, depth, ply, alpha, beta, &tt_score, &tt_move, &tt_depth, &tt_flag, &tt_eval))
-            // OJO: para podar, añadir la condición de que el contador de 50 no esté muy cerca de las tablas (< 90 o algo así)
+        const int tt_permite_corte = read_tt(pos->hash, depth, ply, alpha, beta,
+                                             &tt_score, &tt_move, &tt_depth, &tt_flag, &tt_eval);
+
+        // Consultamos siempre (necesitamos tt_move y tt_eval), pero NO cortamos:
+        //
+        //  - en la raíz: necesitamos recorrer las jugadas para tener PV y bestmove.
+        //  - con el contador de 50 alto.
+        if (tt_permite_corte && ply > 0 && (TT_CORTE_EN_PV || !bEsPV) && pos->half_move_clock < 90)
             return tt_score;
     }
     bool bHayMovTT = (tt_move != MOVE_NONE); // No es constante porque puede cambiar tras IID
@@ -997,17 +1354,26 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
     //              Puede ser tt_score; no se escribe en TT.
     //
     int static_eval = -INFINITO;
-    int raw_eval    = -INFINITO;
+    int eval_base   = -INFINITO;   // eval con la regla de 50, sin correccion ni tt_score: contra ella aprende la corrhist
+    int raw_eval    = EVAL_NONE;   // en jaque no hay eval estática: esto es lo que va a la TT
+    const bool bRecuperarEvalTT = (bHayScoreTT && tt_eval != EVAL_NONE);
     if (!in_check)
     {
         // Usar tt_eval si está disponible para evitar la llamada a nnue_evaluate()
-        raw_eval = (bHayScoreTT && tt_eval != -INFINITO) ? tt_eval : nnue_evaluate(pos);
+        raw_eval = bRecuperarEvalTT ? tt_eval : nnue_evaluate(pos);
 
         // Aplicar ajuste por regla de 50 jugadas
         static_eval = raw_eval * (200 - pos->half_move_clock) / 200;
+        eval_base   = static_eval;
+
+        // Correccion por estructura de peones. Va sobre static_eval, NO sobre
+        // raw_eval: raw_eval es lo que se guarda en la TT y debe quedar en crudo.
+        static_eval += correccion_eval(pos, sd);
+        static_eval = clamp_int(static_eval, -EVAL_MAX, EVAL_MAX);   // la correccion no la mete en zona TB
 
         // Mejorar static_eval con el tt_score si es un bound fiable en la dirección correcta
-        if (bHayScoreTT)
+        // (no con hmc >= 90: el hash no incluye el contador de 50, ver 1.7c; B6)
+        if (bHayScoreTT && pos->half_move_clock < 90)
         {
             if (tt_flag == TT_EXACT
                 || (tt_flag == TT_ALPHA && tt_score < static_eval)
@@ -1050,12 +1416,47 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
         }
     }
 
+    //
+    // Clasificador tactico (WillImprove / WillWorsen / IsStable)
+    //
+    bool bWillImprove = false;
+    bool bWillWorsen  = false;
+    bool bIsStable    = false;
+    if (USA_TC && tc_initialized && !in_check && !bRecuperarEvalTT)
+    {
+        TacticalClass tc = nnue_get_tc();
+        int thr = TC_THRESHOLD;
+        // El clasificador usa perspectiva de blancas (igual que h4[]).
+        // Si juegan negras, mejora para blancas = empeora para el jugador.
+        bool tc_mejora  = ((int)(tc.p_mejora  * 100) >= thr);
+        bool tc_empeora = ((int)(tc.p_empeora * 100) >= thr);
+        bIsStable       = ((int)(tc.p_estable * 100) >= thr);
+        if (pos->side_to_move == WHITE)
+        {
+            bWillImprove = tc_mejora;
+            bWillWorsen  = tc_empeora;
+        }
+        else
+        {
+            bWillImprove = tc_empeora;
+            bWillWorsen  = tc_mejora;
+        }
+
+        // La direccion del clasificador esta invertida cerca de las hojas: solo
+        // se hace caso a partir de TC_DIR_MIN_DEPTH. Ver el comentario en common.h.
+        if (depth < TC_DIR_MIN_DEPTH)
+        {
+            bWillImprove = false;
+            bWillWorsen  = false;
+        }
+    }
+
 	//
 	// IID
 	//
     if (!bHayMovTT
         && depth >= BUS_IID_DEPTH_MIN
-        && static_eval > alpha
+        && static_eval > alpha + bWillImprove * BUS_IID_IMPROVE + bWillWorsen * BUS_IID_WORSEN
         && excluded_move == MOVE_NONE)
     {
         Move iid_pv[MAX_PLY];
@@ -1075,14 +1476,14 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
         && excluded_move == MOVE_NONE)
     {
         if (bEsPV)
-            depth -= BUS_IIR_PVRED;
+            depth -= (BUS_IIR_PVRED + bIsStable * BUS_IIR_PV_STABLE);
         else if (bIsCutNode)
-            depth -= BUS_IIR_CUTRED;
+            depth -= (BUS_IIR_CUTRED + bWillImprove * BUS_IIR_CUT_IMPROVE);
         else
-            depth -= BUS_IIR_ALLRED;
+            depth -= (BUS_IIR_ALLRED + bWillWorsen * BUS_IIR_ALL_WORSEN);
 
         if (depth <= 0)
-            return quiescence(pos, alpha, beta, ply, sd);
+            return quiescence(pos, alpha, beta, ply, sd, false);
     }
 
     const bool bPodable = !bEsPV && !in_check && ply > 0 && excluded_move == MOVE_NONE && MargenesNoMate(alpha, beta);
@@ -1090,22 +1491,24 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
     //
     // Full razoring (por llamarlo de alguna forma)
     // Idea vista en SF y algún otro (Halogen, Reckless...)
+    // OJO: Probar otra forma de aplicar TC: no hacer razoring si bWillImprove
     //
     if (BUS_FULLRAZ_USE
         && bPodable
-        && static_eval < alpha - BUS_FULLRAZ_BASE - BUS_FULLRAZ_MULT * depth * depth)
+        && static_eval < alpha - BUS_FULLRAZ_BASE - BUS_FULLRAZ_MULT * depth * depth + bWillImprove * BUS_FULLRAZ_IMPROVE + bWillWorsen * BUS_FULLRAZ_WORSEN)
     {
-        return quiescence(pos, alpha, beta, ply, sd);
+        return quiescence(pos, alpha, beta, ply, sd, false);
     }
 
 	//
 	// Razoring contra alfa (si estamos tan lejos de alfa que únicamente podemos recuperar con capturas, intentamos llegar a alfa con quiesce)
+    // OJO: Probar otra forma de aplicar TC: no hacer razoring si bWillImprove
 	//
     if (bPodable
         && depth <= BUS_RAZOR_DEPTH
-        && static_eval < alpha - razor_margin[depth < 6 ? depth : 5])
+        && static_eval < alpha - razor_margin[depth < 6 ? depth : 5])   // Idea: + bWillImprove * cte- + bWillWorsen * cte+
     {
-        const int val = quiescence(pos, alpha, beta, ply, sd);
+        const int val = quiescence(pos, alpha, beta, ply, sd, false);
         if (val <= alpha)
             return(val);
     }
@@ -1123,7 +1526,9 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
         // Poda JC (~ reverse futility)
         //
         if (depth <= BUS_PODAJC_DEPTH
-            && static_eval > beta + BUS_PODAJC_MARGIN * (depth - bMejorando)
+            && static_eval < TB_BOUND       // puede ser un mate de la TT: (mate + beta) / 2 no es nada (B8)
+            && (BUS_PODAJC_IFWORSEN || !bWillWorsen)
+            && static_eval > beta + BUS_PODAJC_MARGIN * (depth - bMejorando) // + bWillImprove * BUS_PODAJC_WILLIMPROVE + bWillWorsen * BUS_PODAJC_WILLWORSEN
             && static_eval > BUS_PODAJC_CERO)
         {
             return((static_eval + beta) / 2); // OJO: devolver eval - margen (como Alexandria 9)
@@ -1131,8 +1536,11 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
 
         //
         // Null move
+        // OJO: bWillImprove puede tener el efecto contrario del esperado, porque en realidad dice "tenemos un movimiento que mejora", y en null move no estamos haciendo ese movimiento...
         //
         if (prev_move != MOVE_NONE
+            && (BUS_NM_IFWORSEN || !bWillWorsen)
+            && static_eval >= beta + bWillImprove * BUS_NM_WILLIMPROVE + bIsStable * BUS_NM_ISSTABLE + bWillWorsen * BUS_NM_WILLWORSEN
             && (BUS_NM_CUTYALL || bIsCutNode)) // El parámetro a 1 acepta los nodos ALL
         {
             Position child;
@@ -1140,7 +1548,7 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
             child.prev = (Position*)pos;
             make_null_move(&child);
             
-            int R = BUS_NM_R + depth / 3 + BUS_NM_IMP * bMejorando;
+            int R = BUS_NM_R + depth / 3 + BUS_NM_IMP * (bMejorando || bWillImprove);
             if (static_eval - beta >= BUS_NM_DIV)
                 R += min((static_eval - beta) / BUS_NM_DIV, 3);
             Move null_pv[MAX_PLY]; // Buffer para PV (no se usa aquí)
@@ -1150,7 +1558,7 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
 
             if (score >= beta)
             {
-                if (score >= MATE_BOUND)
+                if (score >= TB_BOUND)      // ni un mate ni una victoria de TB salen de un pase (B7)
                     score = beta;
                 // Verificación
                 if (depth >= BUS_NM_VERIF)
@@ -1173,7 +1581,7 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
     if (bPodable
         && depth >= PROBCUT_DEPTH)
     {
-        const int pbeta = beta + PROBCUT_MARGIN;
+        const int pbeta = beta + PROBCUT_MARGIN + bWillImprove * PROBCUT_WILLIMPROVE + bIsStable * PROBCUT_ISSTABLE + bWillWorsen * PROBCUT_WILLWORSEN;
 
         // Solo buscar si la eval estática sugiere que hay posibilidades
         if (static_eval >= pbeta)
@@ -1198,7 +1606,7 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
                 Move pc_pv[MAX_PLY];
 
                 // Primero quiescence para verificar rápido
-                int pc_score = -quiescence(&pc_child, -pbeta, -pbeta + 1, ply + 1, sd);
+                int pc_score = -quiescence(&pc_child, -pbeta, -pbeta + 1, ply + 1, sd, true);
 
                 // Si quiescence ya supera pbeta, verificar con búsqueda más profunda
                 if (pc_score >= pbeta && depth - PROBCUT_REDUCTION > 0)
@@ -1273,7 +1681,8 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
     //
     MoveList moves;
     generate_moves(pos, &moves, GEN_ALL);
-    sort_moves(&moves, tt_move, ply, prev_move, pos, sd);
+    int move_scores[256];
+    score_moves(&moves, move_scores, tt_move, ply, prev_move, pos, sd);
 
     int legal_moves = 0;
     int best_score = -MATE_SCORE;
@@ -1305,16 +1714,23 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
     //
     for (int i = 0; i < moves.count; i++)
     {
+        pick_move(&moves, move_scores, i);
         if (moves.moves[i] == excluded_move)
             continue;
 
         const bool bEsCaptura = GET_MOVE_CAPTURE(moves.moves[i]);
         const bool bEsPromo   = GET_MOVE_PROMOTED(moves.moves[i]);
 
+        // Si la jugada da jaque. Se calcula ANTES de mover y una sola vez: lo usan
+        // las podas estaticas, LMP y la extension de jaque. Antes se calculaba dos
+        // veces (aqui con gives_check() y despues de mover con is_square_attacked()).
+        // Verificado equivalente sobre 11 millones de jugadas, 0 discrepancias.
+        const int bDaJaque = gives_check(pos, moves.moves[i]);
+
         //
         // Podas estáticas contra el movimiento
         //
-        if (legal_moves > 0 && !bEsPromo && !in_check && !bEsPV && abs(static_eval) < MATE_BOUND && bTieneAlgunaPieza && !gives_check(pos, moves.moves[i]))
+        if (legal_moves > 0 && !bEsPromo && !in_check && !bEsPV && abs(static_eval) < MATE_BOUND && bTieneAlgunaPieza && !bDaJaque)
         {
             // OJO: en capturas utilizamos depth, mientras que en no capturas utilizamos lmrDepth
             if (bEsCaptura)
@@ -1437,12 +1853,40 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
             }
         }
 
+        //
+        // LMP (Late Move Pruning)
+        //
+        // Va ANTES de copy_position + make_move. Antes iba despues, y cada jugada
+        // podada tiraba a la basura la actualizacion incremental del acumulador NNUE,
+        // que es el 82 % del coste de make_move (0,075 de 0,092 us medidos).
+        //
+        // Ademas la jugada ya se habia anotado en quiets_tried[], asi que recibia
+        // malus de history y de continuation history sin haber sido buscada jamas.
+        // Al podar aqui, quiets_tried[] solo contiene jugadas realmente buscadas.
+        //
+        // OJO: legal_moves todavia NO incluye la jugada actual, de ahi el >= en vez
+        // del > que habia cuando la comprobacion iba despues de legal_moves++.
+        if (bPodable
+            && !bDaJaque
+            && depth <= LMP_DEPTH
+            && legal_moves >= (LMP_BASE + depth * depth) / (bMejorando ? 1 : 2)
+            && !bEsCaptura
+            && !bEsPromo
+            && bTieneAlgunaPieza)
+        {
+            continue;
+        }
+
         copy_position(&child, pos);
         child.prev = (Position*)pos; // Enlazar para detección de repeticiones
         
         // Si el movimiento es ilegal, lo saltamos
-        if (!make_move(&child, moves.moves[i])) ////////////////////////////////////////////////////////////////////////////////
+        if (!make_move(&child, moves.moves[i]))
             continue;
+
+        // Traer ya la linea de cache de la TT del hijo: para cuando el nodo hijo la
+        // sondee, la memoria estara en camino.
+        tt_prefetch(child.hash);
         
         legal_moves++;
 
@@ -1454,31 +1898,14 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
 
         if (sd->thread_id == 0 && ply == 0 && ATOMIC_LOAD(search_flag_infinite) && depth > 15)
         {
-            printf("info currmove ");
-            print_move(moves.moves[i]);
-            printf(" currmovenumber %d\n", legal_moves);
+            char s_move[8];
+            move_to_str(moves.moves[i], s_move);
+            printf("info currmove %s currmovenumber %d\n", s_move, legal_moves);   // una sola escritura (B19)
             fflush(stdout);
         }
         
-        // Detectar si el movimiento da jaque (jaque después del movimiento)
-        int gives_check = is_square_attacked(&child, get_lsb_index(child.pieces[child.side_to_move][KING]), child.side_to_move ^ 1);
-
-        //
-        // LMP (Late Move Pruning)
-        // OJO: ahora tengo gives_check antes de mover, así que creo que podría pasar LMP a antes de mover
-        if (bPodable
-            && !gives_check
-            && depth <= LMP_DEPTH
-            && legal_moves > (LMP_BASE + depth * depth) / (bMejorando ? 1 : 2)
-            && !bEsCaptura
-            && !bEsPromo
-            && bTieneAlgunaPieza)
-        {
-            continue;
-        }
-
         // Extensión de jaque (acumulando la singular, si la hay)
-        int extension = gives_check;
+        int extension = bDaJaque;
         if (moves.moves[i] == tt_move)
             extension += singular_extension;
 
@@ -1489,7 +1916,14 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
         int max_extensions = (int)(sd->search_root_depth * EXT_LIMIT_MULTIPLIER);
 
         if (extensions_used >= max_extensions)
-            extension = 0;                                  // Si ya superamos el límite, no permitir más extensiones
+        {
+            // Si ya superamos el límite, no permitir más extensiones POSITIVAS.
+            //
+            // OJO: antes se ponía a 0 sin más, lo que también anulaba las extensiones
+            // negativas de la singular. Es decir, justo cuando se había decidido que el
+            // árbol ya era demasiado grande, se dejaba de recortarlo.
+            extension = min(extension, 0);
+        }
         else if (extensions_used + extension > max_extensions)
             extension = max_extensions - extensions_used;   // Si la extensión propuesta nos pasaría del límite, recortarla
 
@@ -1529,7 +1963,7 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
                 && moves.moves[i] != sd->killer_moves[ply][0]
                 && moves.moves[i] != sd->killer_moves[ply][1])
             {
-                if (gives_check)
+                if (bDaJaque)
                     reduction += LMR_CHECK_DEPTH;   // -
                 if (bIsCutNode)
                     reduction += LMR_CUT_DEPTH;     // +
@@ -1582,6 +2016,20 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
                             reduction -= 3; // 1 * 3
                     }
                 }
+
+                // Ajuste por clasificador tactico
+                if (bWillImprove)
+                {
+                    reduction += LMR_TC_WILLIMPROVE;
+                    reduction += LMR_TC_WLLIMPBETA * (static_eval > beta);
+                }
+                if (bWillWorsen)
+                {
+                    reduction += LMR_TC_WILLWORSEN;
+                    reduction += LMR_TC_WILWORALPHA * (static_eval < alpha);
+                }
+                if (bIsStable)
+                    reduction += LMR_TC_ISSTABLE;
 
                 // Aplicar el factor de escala logarítmico suavizado a la suma de modificadores
                 // lmr_red(depth) devuelve: 0 (d<4), 1 (d=4..7), 2 (d=8..15), 3 (d=16..31), 4 (d=32..63)
@@ -1651,7 +2099,9 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
             // Actualizar PV: Mejor movimiento + PV del hijo
             pv[0] = moves.moves[i];
             int j = 0;
-            while (child_pv[j] != MOVE_NONE && (j + 1) < MAX_PLY)
+            // OJO: (j + 2) y no (j + 1): tras el bucle se escribe pv[j + 1], que con
+            // la condición antigua podía valer pv[MAX_PLY] y salirse del array.
+            while (child_pv[j] != MOVE_NONE && (j + 2) < MAX_PLY)
             {
                 pv[j + 1] = child_pv[j];
                 j++;
@@ -1666,8 +2116,8 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
         
         if (alpha >= beta)
         {
-            if (excluded_move == MOVE_NONE)
-                write_tt(pos->hash, depth, ply, beta, TT_BETA, moves.moves[i], static_eval);
+            // (La entrada de TT se escribe una sola vez, al salir del bucle: escribirla
+            //  aquí además era trabajo duplicado y guardaba beta en vez de best_score.)
 
             // Killer Heuristic: Guardar movimientos quietos que causan un corte
             if (!bEsCaptura && ply < MAX_PLY)
@@ -1676,7 +2126,7 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
                 sd->killer_moves[ply][0] = moves.moves[i];
 
                 // History Heuristic: Premiar jugadas que causan corte
-                int bonus = depth * depth;
+                int bonus = min(depth * depth, 16384);   // por encima del divisor de la gravedad diverge (B24)
                 int side = pos->side_to_move;
                 int source = GET_MOVE_SOURCE(moves.moves[i]);
                 int target = GET_MOVE_TARGET(moves.moves[i]);
@@ -1773,10 +2223,30 @@ int negamax(Position* pos, int alpha, int beta, int depth, int ply, Move prev_mo
             return 0; // Ahogado (Tablas)
     }
 
-    // Guardar en TT.
-    // Se escribe raw_eval (salida pura de NNUE), NUNCA static_eval.
-    // static_eval puede contener tt_score (un score de búsqueda) y contaminaría
-    // el campo eval de futuras entradas si se guardara aquí.
+    // Correction history: aprender el sesgo de esta estructura de peones.
+    //
+    // Version 2 (B3, B4, B5):
+    //  - Se aprende contra eval_base (eval de la red con la regla de 50, sin la correccion
+    //    y sin sustituir por tt_score). Antes era contra static_eval: con la correccion
+    //    ya sumada la media movil convergia a la MITAD del sesgo, y con tt_score se
+    //    aprendia busqueda menos busqueda (y un mate de la TT saturaba la entrada).
+    //  - Solo si el score es fiable en la direccion de la correccion: hacia abajo, si es
+    //    una cota superior de verdad o exacto (best_score < beta); hacia arriba, si es
+    //    una cota inferior o exacto (best_score > alfa original). Antes la guarda de
+    //    subida era "hay mejor jugada", que se cumple casi siempre, y los fail-low
+    //    (cotas superiores) subian la correccion.
+    if (!in_check
+        && excluded_move == MOVE_NONE
+        && eval_base != -INFINITO
+        && abs(best_score) < TB_BOUND
+        && !(best_move_this_node != MOVE_NONE && GET_MOVE_CAPTURE(best_move_this_node))
+        && ((best_score < eval_base && best_score < beta)
+            || (best_score > eval_base && best_score > original_alpha)))
+    {
+        actualizar_correccion(pos, sd, best_score - eval_base, depth);
+    }
+
+    // Guardar en TT
     if (excluded_move == MOVE_NONE)
     {
         tt_flag = (best_score <= original_alpha) ? TT_ALPHA : (best_score >= beta ? TT_BETA : TT_EXACT);
@@ -1802,14 +2272,19 @@ static void calculate_time_allocation(const Position* pos, SearchLimits limits)
         ATOMIC_STORE(search_time_soft, limits.movetime);
         ATOMIC_STORE(search_time_hard, limits.movetime);
     }
-    else if (limits.wtime > 0 || limits.btime > 0) // Modo partida
+    else if (limits.reloj) // Modo partida: llego reloj, aunque sea 0 o negativo (B12)
     {
         int time_left = (pos->side_to_move == WHITE) ? limits.wtime : limits.btime;
         int inc = (pos->side_to_move == WHITE) ? limits.winc : limits.binc;
         int movestogo = (limits.movestogo > 0) ? limits.movestogo : MOVESTOGO;
 
-        // Margen de seguridad por lag (50ms)
-        time_left = max(0, time_left - 50);
+        // Margen de seguridad por lag (50 ms). Con menos de 100 ms se reserva la mitad
+        // en vez de 50: restar 50 dejaba time_left = 0 y, con ello, hard = 0, que en
+        // todo el motor significa 'sin limite' (I01).
+        if (time_left > 100)
+            time_left -= 50;
+        else
+            time_left = max(1, time_left / 2);
 
         double base_time;
         if (limits.movestogo > 0)
@@ -1843,6 +2318,24 @@ static void calculate_time_allocation(const Position* pos, SearchLimits limits)
         if (soft > time_left * 0.7)
             soft = (long long)(time_left * 0.7);
 
+        // Con movestogo hay que guardar reloj para las jugadas que faltan hasta el
+        // control: con mtg <= 4, 5 * base ya era todo el reloj, y una iteracion que se
+        // dispara podia dejar 50 ms para las ultimas jugadas (B11).
+        if (limits.movestogo > 1)
+        {
+            const long long reserva = (long long)(limits.movestogo - 1) * time_left / (2LL * limits.movestogo);
+            if (hard > time_left - reserva)
+                hard = time_left - reserva;
+            if (soft > hard)
+                soft = hard;
+        }
+
+        // Con reloj finito el limite nunca puede ser 0: 0 significa 'sin limite'.
+        if (hard < 1)
+            hard = 1;
+        if (soft < 1)
+            soft = 1;
+
         ATOMIC_STORE(search_time_soft, soft);
         ATOMIC_STORE(search_time_hard, hard);
     }
@@ -1850,6 +2343,47 @@ static void calculate_time_allocation(const Position* pos, SearchLimits limits)
 
 // Variable estática para saber el bando (necesaria para ponderhit)
 static int search_side;
+
+// Fija el estado de control de la busqueda: limites, banderas de ponder/infinite,
+// bando y reloj. La llama quien lanza la busqueda (engine_go, en el hilo UCI) ANTES de
+// crear el hilo de busqueda. Antes lo hacia el propio hilo al arrancar, y un
+// 'ponderhit' llegado antes de eso se perdia: el motor ponderaba para siempre y
+// perdia por tiempo (B1). De paso, el reloj arranca al recibir 'go'.
+void preparar_busqueda(const Position* pos, SearchLimits limits)
+{
+    current_limits = limits;
+    ATOMIC_STORE(search_max_nodes, limits.nodes > 0 ? limits.nodes : 0);
+    ATOMIC_STORE(search_flag_infinite, limits.infinite ? 1 : 0);
+    ATOMIC_STORE(search_flag_ponder, limits.ponder ? 1 : 0);
+    search_side = pos->side_to_move;
+
+    search_start_time = get_time_ms();
+    ATOMIC_STORE(search_time_soft, -1);
+    ATOMIC_STORE(search_time_hard, -1);
+    if (!limits.ponder && !limits.infinite)
+        calculate_time_allocation(pos, limits);
+}
+
+int busqueda_espera_stop(void)
+{
+    return ATOMIC_LOAD(search_flag_infinite) || ATOMIC_LOAD(search_flag_ponder);
+}
+
+// UCI: en 'go infinite' y 'go ponder' el bestmove solo puede salir tras 'stop' o
+// 'ponderhit' (I08). Se espera a la parada del GUI (stop_gui) y no a stop_search,
+// porque esa tambien la pone el limite de nodos: con 'go ponder ... nodes N' el
+// bestmove salia antes del ponderhit (B13).
+static void esperar_stop_o_ponderhit(void)
+{
+    while (busqueda_espera_stop() && !ATOMIC_LOAD(stop_gui))
+    {
+#ifdef _WIN32
+        Sleep(1);
+#else
+        usleep(1000);
+#endif
+    }
+}
 
 // --- Lazy SMP Worker ---
 #ifdef USE_SMP
@@ -1865,10 +2399,7 @@ void* search_worker(void* lpParam)
     // Inicializar datos del hilo
     ATOMIC_STORE(sd->nodes, 0);
     sd->sel_depth = 0;
-    memset(sd->killer_moves, 0, sizeof(sd->killer_moves));
-    memset(sd->history_moves, 0, sizeof(sd->history_moves));
-    memset(sd->counter_moves, 0, sizeof(sd->counter_moves));
-    memset(sd->capture_history, 0, sizeof(sd->capture_history));
+    preparar_heuristicas(sd);
 
     // Copia local de la posición raíz
     Position pos;
@@ -1906,17 +2437,18 @@ void* search_worker(void* lpParam)
  */
 void search_position(Position* pos, SearchLimits limits)
 {
-    ATOMIC_STORE(stop_search, 0);
-    current_limits = limits; // Guardar copia global
-    ATOMIC_STORE(search_flag_infinite, limits.infinite ? 1 : 0);
-    ATOMIC_STORE(search_flag_ponder, limits.ponder ? 1 : 0);
-    search_side = pos->side_to_move;
+    // El estado de control (stop_search, limites, banderas, reloj) lo fija quien lanza
+    // la busqueda, con preparar_busqueda(), ANTES de crear este hilo: si lo hiciera el
+    // hilo, un 'stop' o un 'ponderhit' llegado antes de que arrancase se perdia (B1, I10).
 
     // Incrementar generación de TT (aging automático)
     tt_new_search();
 
     // --- Syzygy Root Probe (Solución a Ceguera de WDL / Shuffling) ---
     int pieces = count_bits(pos->all);
+    // En infinite/ponder tambien se juega la jugada DTZ, pero el bestmove espera a
+    // stop/ponderhit (I07). Antes se saltaba el atajo y tras el ponderhit decidia la
+    // WDL a ciegas del arbol (B2).
     if (pieces <= opt_syzygy_probe_limit && (unsigned)pieces <= TB_LARGEST)
     {
         int castling = pos->castling_rights;
@@ -1989,35 +2521,46 @@ void search_position(Position* pos, SearchLimits limits)
                 else if (wdl == TB_BLESSED_LOSS)
                     score = opt_syzygy_50move_rule ? 0 : (-TB_MAX + dtz);
 
-                printf("info depth 1 score ");
-                print_score(score);
-                printf(" time 0 nodes 0 pv ");
-                print_move(tb_move);
-                printf("\n");
+                char s_score[32];
+                char s_move[8];
+                score_a_texto(score, s_score, sizeof(s_score));
+                move_to_str(tb_move, s_move);
+                printf("info depth 1 score %s time 0 nodes 0 pv %s\n", s_score, s_move);
+                fflush(stdout);
+                esperar_stop_o_ponderhit();
                 
-                printf("bestmove ");
-                print_move(tb_move);
-                printf("\n");
+                printf("bestmove %s\n", s_move);
                 fflush(stdout);
 
                 // Retornar inmediatamente evita que inicie toda la búsqueda Iterativa 
                 // y los hilos en Lazy SMP de forma innecesaria.
-                ATOMIC_STORE(is_searching, 0);
+                last_search_nodes = 0;
+                ATOMIC_STORE(search_flag_ponder, 0);
+                ATOMIC_STORE(search_flag_infinite, 0);
+                ATOMIC_STORE_REL(is_searching, 0);
                 return;
             }
         }
     }
 
     // Configurar datos del hilo principal (ID 0)
-    SearchData main_sd;
-    main_sd.thread_id = 0;
-    ATOMIC_STORE(main_sd.nodes, 0);
-    main_sd.sel_depth = 0;
-    memset(main_sd.killer_moves, 0, sizeof(main_sd.killer_moves));
-    memset(main_sd.history_moves, 0, sizeof(main_sd.history_moves));
-    memset(main_sd.counter_moves, 0, sizeof(main_sd.counter_moves));
-    memset(main_sd.capture_history, 0, sizeof(main_sd.capture_history));
-    copy_position(&main_sd.root_pos, pos);
+    // SearchData ocupa ~90 KB (history, counter moves, capture history). En la pila
+    // se comía casi una décima parte del hilo de búsqueda; al heap.
+    SearchData* main_sd_ptr = obtener_sd_pool(1);
+    if (!main_sd_ptr)
+    {
+        printf("info string Error: sin memoria para SearchData\n");
+        printf("bestmove 0000\n");
+        fflush(stdout);
+        last_search_nodes = 0;
+        ATOMIC_STORE(is_searching, 0);
+        return;
+    }
+    main_sd_ptr->thread_id = 0;
+    ATOMIC_STORE(main_sd_ptr->nodes, 0);
+    main_sd_ptr->sel_depth = 0;
+    preparar_heuristicas(main_sd_ptr);
+    copy_position(&main_sd_ptr->root_pos, pos);
 
     // --- Lazy SMP: Lanzar helpers ---
 #ifdef USE_SMP
@@ -2032,7 +2575,13 @@ void search_position(Position* pos, SearchLimits limits)
 
     if (num_helpers > 0)
     {
-        helper_data = (SearchData*)malloc(num_helpers * sizeof(SearchData));
+        // obtener_sd_pool puede mover el bloque: se recalcula tambien main_sd_ptr.
+        SearchData* pool = obtener_sd_pool(num_helpers + 1);
+        if (pool)
+        {
+            main_sd_ptr = &pool[0];
+            helper_data = &pool[1];
+        }
         if (!helper_data)
         {
             printf("info string Error: Failed to allocate memory for helper data\n");
@@ -2051,17 +2600,20 @@ void search_position(Position* pos, SearchLimits limits)
         if (!helper_threads)
         {
             printf("info string Error: Failed to allocate memory for helper threads\n");
-            free(helper_data);
             num_helpers = 0;
         }
 
         for (int i = 0; i < num_helpers; i++)
         {
             helper_data[i].thread_id = i + 1;
+            ATOMIC_STORE(helper_data[i].nodes, 0);   // la info de profundidad 1 los suma antes de que arranque el hilo (B29)
+            helper_data[i].sel_depth = 0;
             copy_position(&helper_data[i].root_pos, pos);
 
 #ifdef _WIN32
-            helper_threads[i] = CreateThread(NULL, 0, search_worker, &helper_data[i], 0, NULL);
+            // 8 MB de pila: negamax gasta 4512 bytes por nivel y puede anidar hasta
+            // MAX_PLY, lo que se acerca peligrosamente al 1 MB por defecto.
+            helper_threads[i] = CreateThread(NULL, 8 << 20, search_worker, &helper_data[i], 0, NULL);
             if (helper_threads[i] == NULL)
             {
                 printf("info string Error: Failed to create thread %d\n", i+1);
@@ -2070,7 +2622,10 @@ void search_position(Position* pos, SearchLimits limits)
                 break;
             }
 #else
-            if (pthread_create(&helper_threads[i], NULL, search_worker, &helper_data[i]) != 0)
+            pthread_attr_t attr_helper;
+            pthread_attr_init(&attr_helper);
+            pthread_attr_setstacksize(&attr_helper, 8 << 20);
+            if (pthread_create(&helper_threads[i], &attr_helper, search_worker, &helper_data[i]) != 0)
             {
                 printf("info string Error: Failed to create thread %d\n", i+1);
                 num_helpers = i;
@@ -2097,16 +2652,14 @@ void search_position(Position* pos, SearchLimits limits)
     }
 
     // --- Gestión de Tiempo ---
-    search_start_time = get_time_ms();
-    ATOMIC_STORE(search_time_soft, -1);
-    ATOMIC_STORE(search_time_hard, -1);
+    // (El reloj y los limites ya los fijo preparar_busqueda() al recibir 'go'.)
     
-    if (!limits.ponder && !limits.infinite)
-        calculate_time_allocation(pos, limits);
 
     int depth = limits.depth;
     if (depth == 0 || limits.infinite || limits.ponder)
         depth = MAX_PLY - 1; // Si es infinite, ponemos un límite alto (respetando buffer PV)
+    if (depth > MAX_PLY - 1)
+        depth = MAX_PLY - 1; // 'go depth 250': la history divergia y desbordaba int (B24)
 
     // Si hay tiempo definido, limitamos la profundidad máxima para evitar bucles infinitos accidentales
     if (ATOMIC_LOAD(search_time_hard) > 0 && limits.depth == 0)
@@ -2114,6 +2667,13 @@ void search_position(Position* pos, SearchLimits limits)
 
     Move best_move = MOVE_NONE;
     Move ponder_move = MOVE_NONE;
+    // Datos de la jugada que se va a jugar, para la info final: la de la ultima
+    // iteracion completa o la de un fail-high posterior (entonces su score es una cota
+    // inferior). Antes se mezclaba la jugada del fail-high con el score viejo (B14).
+    int ultima_prof = 0;
+    int ultima_sel = 0;
+    int score_jugada = 0;
+    int cota_inferior = 0;
     int prev_score = 0;
     long long last_iter_time = 0;
     long long last_iter_nodes = 0;
@@ -2124,7 +2684,7 @@ void search_position(Position* pos, SearchLimits limits)
     for (int current_depth = 1; current_depth <= depth; current_depth++)
     {
         long long iter_start_time = get_time_ms();
-        long long iter_start_nodes = ATOMIC_LOAD(main_sd.nodes);
+        long long iter_start_nodes = ATOMIC_LOAD(main_sd_ptr->nodes);
 
         Move root_pv[MAX_PLY];
         root_pv[0] = MOVE_NONE;
@@ -2150,9 +2710,9 @@ void search_position(Position* pos, SearchLimits limits)
         while (1)
         {
             // Establecer profundidad raíz para control de extensiones
-            main_sd.search_root_depth = search_depth;
+            main_sd_ptr->search_root_depth = search_depth;
 
-            score = negamax(pos, alpha, beta, search_depth, 0, MOVE_NONE, MOVE_NONE, root_pv, false, &main_sd);
+            score = negamax(pos, alpha, beta, search_depth, 0, MOVE_NONE, MOVE_NONE, root_pv, false, main_sd_ptr);
 
             // Si se detuvo la búsqueda, salir inmediatamente
             if (ATOMIC_LOAD(stop_search))
@@ -2182,10 +2742,10 @@ void search_position(Position* pos, SearchLimits limits)
                 }
 
                 // Info para debug
-                if (ATOMIC_LOAD(main_sd.nodes) >= 100000 || limits.infinite)
+                if (salida_busqueda && (ATOMIC_LOAD(main_sd_ptr->nodes) >= 100000 || limits.infinite))
                 {
                     long long current_time = get_time_ms();
-                    long long total_nodes_fl = ATOMIC_LOAD(main_sd.nodes);
+                    long long total_nodes_fl = ATOMIC_LOAD(main_sd_ptr->nodes);
 #ifdef USE_SMP
                     if (helper_data)
                     {
@@ -2193,15 +2753,12 @@ void search_position(Position* pos, SearchLimits limits)
                             total_nodes_fl += ATOMIC_LOAD(helper_data[i].nodes);
                     }
 #endif
-                    printf("info depth %d score ", current_depth);
-                    print_score(score);
-                    printf(" upperbound nodes %lld time %lld pv ", total_nodes_fl, current_time - search_start_time);
-                    for (int j = 0; root_pv[j] != MOVE_NONE; j++)
-                    {
-                        print_move(root_pv[j]);
-                        printf(" ");
-                    }
-                    printf("\n");
+                    char s_score[32];
+                    char s_pv[1024];
+                    score_a_texto(score, s_score, sizeof(s_score));
+                    pv_a_texto(root_pv, s_pv, sizeof(s_pv));
+                    printf("info depth %d score %s upperbound nodes %lld time %lld pv %s\n",
+                           current_depth, s_score, total_nodes_fl, current_time - search_start_time, s_pv);
                     fflush(stdout);
                 }
                 continue;
@@ -2217,7 +2774,14 @@ void search_position(Position* pos, SearchLimits limits)
 
                 // Guardar movimiento provisional por si se acaba el tiempo
                 if (root_pv[0] != MOVE_NONE)
+                {
                     best_move = root_pv[0];
+                    ponder_move = root_pv[1];   // si no, podia quedar la de otra jugada (I17)
+                    ultima_prof = current_depth;
+                    ultima_sel = main_sd_ptr->sel_depth;
+                    score_jugada = score;
+                    cota_inferior = 1;
+                }
 
                 // Después de MAX_ASPIRATION_FAILS fallos, abrir ventana completa
                 if (fail_lows + fail_highs >= MAX_ASPIRATION_FAILS)
@@ -2233,25 +2797,22 @@ void search_position(Position* pos, SearchLimits limits)
                 }
 
                 // Info para debug
-                if (ATOMIC_LOAD(main_sd.nodes) >= 100000 || limits.infinite)
+                if (salida_busqueda && (ATOMIC_LOAD(main_sd_ptr->nodes) >= 100000 || limits.infinite))
                 {
                     long long current_time = get_time_ms();
-                    long long total_nodes_fh = ATOMIC_LOAD(main_sd.nodes);
+                    long long total_nodes_fh = ATOMIC_LOAD(main_sd_ptr->nodes);
 #ifdef USE_SMP
                     if (helper_data) {
                         for (int i = 0; i < num_helpers; i++)
                             total_nodes_fh += ATOMIC_LOAD(helper_data[i].nodes);
                     }
 #endif
-                    printf("info depth %d score ", current_depth);
-                    print_score(score);
-                    printf(" lowerbound nodes %lld time %lld pv ", total_nodes_fh, current_time - search_start_time);
-                    for (int j = 0; root_pv[j] != MOVE_NONE; j++)
-                    {
-                        print_move(root_pv[j]);
-                        printf(" ");
-                    }
-                    printf("\n");
+                    char s_score[32];
+                    char s_pv[1024];
+                    score_a_texto(score, s_score, sizeof(s_score));
+                    pv_a_texto(root_pv, s_pv, sizeof(s_pv));
+                    printf("info depth %d score %s lowerbound nodes %lld time %lld pv %s\n",
+                           current_depth, s_score, total_nodes_fh, current_time - search_start_time, s_pv);
                     fflush(stdout);
                 }
                 continue;
@@ -2266,7 +2827,10 @@ void search_position(Position* pos, SearchLimits limits)
             break;
 
         // Si encontramos un mate a favor mejor que en la búsqueda anterior (con prof >= 10), mover rápido.
-        if (!limits.infinite && !limits.ponder && current_depth >= 10 && score >= MATE_BOUND && score > previous_search_score)
+        // Solo con reloj: con 'go depth' o 'go nodes' el resultado dependia de la busqueda
+        // anterior (B30). Con las banderas, y no con limits, vale tambien tras un ponderhit.
+        if (ATOMIC_LOAD(search_time_hard) > 0 && !busqueda_espera_stop()
+            && current_depth >= 10 && score >= MATE_BOUND && score > previous_search_score)
         {
             ATOMIC_STORE(stop_search, 1);
         }
@@ -2285,14 +2849,18 @@ void search_position(Position* pos, SearchLimits limits)
         {
             best_move = root_pv[0];
             ponder_move = root_pv[1];
+            ultima_prof = current_depth;
+            ultima_sel = main_sd_ptr->sel_depth;
+            score_jugada = score;
+            cota_inferior = 0;
 
-            if (ATOMIC_LOAD(main_sd.nodes) >= 100000 || limits.infinite)
+            if (salida_busqueda)
             {
                 long long current_time = get_time_ms();
                 long long elapsed = current_time - search_start_time;
 
                 // Calcular nodos totales (Main + Helpers)
-                long long total_nodes = ATOMIC_LOAD(main_sd.nodes);
+                long long total_nodes = ATOMIC_LOAD(main_sd_ptr->nodes);
 #ifdef USE_SMP
                 if (helper_data)
                 {
@@ -2301,17 +2869,12 @@ void search_position(Position* pos, SearchLimits limits)
                 }
 #endif
 
-                printf("info depth %d seldepth %d score ", current_depth, main_sd.sel_depth);
-                print_score(score);
-                printf(" nodes %lld time %lld pv ", total_nodes, elapsed);
-
-                // Imprimir línea PV completa
-                for (int j = 0; root_pv[j] != MOVE_NONE; j++)
-                {
-                    print_move(root_pv[j]);
-                    printf(" ");
-                }
-                printf("\n");
+                char s_score[32];
+                char s_pv[1024];
+                score_a_texto(score, s_score, sizeof(s_score));
+                pv_a_texto(root_pv, s_pv, sizeof(s_pv));
+                printf("info depth %d seldepth %d score %s nodes %lld time %lld pv %s\n",
+                       current_depth, main_sd_ptr->sel_depth, s_score, total_nodes, elapsed, s_pv);
                 fflush(stdout);
             }
         }
@@ -2324,7 +2887,7 @@ void search_position(Position* pos, SearchLimits limits)
         if (current_iter_time <= 0)
             current_iter_time = 1;
             
-        long long current_iter_nodes = ATOMIC_LOAD(main_sd.nodes) - iter_start_nodes;
+        long long current_iter_nodes = ATOMIC_LOAD(main_sd_ptr->nodes) - iter_start_nodes;
 
         // Actualizar contador de estabilidad
         if (best_move == last_best_move && best_move != MOVE_NONE)
@@ -2504,8 +3067,15 @@ void search_position(Position* pos, SearchLimits limits)
         score_history[0] = score;
     }
 
+    // UCI: en 'go infinite' y 'go ponder' bestmove solo puede salir tras 'stop' o
+    // 'ponderhit', aunque el bucle de profundidades se haya agotado (I08, B13).
+    esperar_stop_o_ponderhit();
+
     // Detener helpers
     ATOMIC_STORE(stop_search, 1);
+
+    // Nodos totales de esta busqueda (los helpers se suman tras el join)
+    long long nodos_busqueda = ATOMIC_LOAD(main_sd_ptr->nodes);
 #ifdef USE_SMP
     if (num_helpers > 0)
     {
@@ -2526,10 +3096,14 @@ void search_position(Position* pos, SearchLimits limits)
         for (int i = 0; i < num_helpers; i++)
             pthread_join(helper_threads[i], NULL);
 #endif
-        free(helper_data);
+        for (int i = 0; i < num_helpers; i++)
+            nodos_busqueda += ATOMIC_LOAD(helper_data[i].nodes);
+
         free(helper_threads);
     }
 #endif // USE_SMP
+
+    last_search_nodes = nodos_busqueda;
 
     // Movimiento de emergencia: si no tenemos movimiento, generar uno legal
     if (best_move == MOVE_NONE)
@@ -2564,39 +3138,90 @@ void search_position(Position* pos, SearchLimits limits)
             Move tt_move = MOVE_NONE;
             // Consultar TT. Los valores de alpha/beta/depth no importan para recuperar el movimiento.
             read_tt(next_pos.hash, 0, 0, -INFINITO, INFINITO, &tt_score, &tt_move, &tt_depth, &tt_flag, NULL);
+            // La TT puede devolver la jugada de otra posicion: validarla antes de usarla.
             if (tt_move != MOVE_NONE)
-                ponder_move = tt_move;
+            {
+                MoveList resp;
+                generate_moves(&next_pos, &resp, GEN_ALL);
+                for (int i = 0; i < resp.count; i++)
+                {
+                    if (resp.moves[i] == tt_move)
+                    {
+                        Position prueba;
+                        copy_position(&prueba, &next_pos);
+                        if (make_move(&prueba, tt_move))
+                            ponder_move = tt_move;
+                        break;
+                    }
+                }
+            }
         }
     }
 
     // Guardar el score final de la búsqueda para comparar en la siguiente jugada
     previous_search_score = score_history[0];
 
-    printf("bestmove ");
+    // Info final con los nodos REALES de la busqueda. Las de cada iteracion solo
+    // salen al completarla; si 'go nodes N' o el reloj cortan a media iteracion, la
+    // ultima info se quedaba muy por debajo de lo buscado (con go nodes 100000 decia
+    // 42.650). El Juez y cualquier arbitro leen los nodos de esta ultima linea.
+    if (salida_busqueda && best_move != MOVE_NONE && ultima_prof > 0)
+    {
+        // PV de una sola jugada: con la ponder detras, si best_move cierra una
+        // repeticion, la siguiente quedaria 'despues de las tablas'
+        char s_score[32];
+        char s_move[8];
+        score_a_texto(score_jugada, s_score, sizeof(s_score));
+        move_to_str(best_move, s_move);
+        printf("info depth %d seldepth %d score %s%s nodes %lld time %lld pv %s\n",
+               ultima_prof, ultima_sel, s_score, cota_inferior ? " lowerbound" : "",
+               nodos_busqueda, get_time_ms() - search_start_time, s_move);
+        fflush(stdout);
+    }
+
+
+    ATOMIC_STORE(search_flag_ponder, 0);     // un 'ponderhit' tardio ya no debe hacer nada
+    ATOMIC_STORE(search_flag_infinite, 0);
+
+    if (!salida_busqueda)
+    {
+        ATOMIC_STORE_REL(is_searching, 0);
+        return;
+    }
+
+    // Una sola escritura: a trozos, un 'readyok' del hilo UCI podia colarse en medio
+    // y el GUI leia 'bestmove readyok' (B19)
+    char linea[64];
     if (best_move != MOVE_NONE)
     {
-        print_move(best_move);
+        char s_best[8];
+        move_to_str(best_move, s_best);
         if (opt_ponder && ponder_move != MOVE_NONE)
         {
-            printf(" ponder ");
-            print_move(ponder_move);
+            char s_ponder[8];
+            move_to_str(ponder_move, s_ponder);
+            snprintf(linea, sizeof(linea), "bestmove %s ponder %s\n", s_best, s_ponder);
         }
-        printf("\n");
+        else
+        {
+            snprintf(linea, sizeof(linea), "bestmove %s\n", s_best);
+        }
     }
     else
     {
-        printf("0000\n"); // No move (mate o ahogado - posición terminal)
+        snprintf(linea, sizeof(linea), "bestmove 0000\n"); // posición terminal: mate o ahogado
     }
+    printf("%s", linea);
     fflush(stdout);
 
-    ATOMIC_STORE(is_searching, 0);
+    ATOMIC_STORE_REL(is_searching, 0);
 }
 
 void engine_ponderhit()
 {
     if (ATOMIC_LOAD(search_flag_ponder))
     {
-        printf("Info: Ponderhit recibido, cambiando a modo normal.\n");
+        printf("info string Ponderhit recibido, cambiando a modo normal\n");
         ATOMIC_STORE(search_flag_ponder, 0);
         
         // IMPORTANTE: NO reseteamos search_start_time.

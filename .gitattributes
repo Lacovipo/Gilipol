@@ -1,0 +1,13 @@
+# Guardar TODOS los ficheros byte a byte, sin que git toque los finales de linea.
+#
+# El proyecto tiene finales mixtos (main.c usa LF, el resto CRLF). Si git
+# normalizara, un solo commit reescribiria ficheros enteros y los diffs
+# dejarian de ser legibles. Con "-text" se desactiva toda conversion.
+* -text
+
+# Marcar como binarios los que lo son, para que git no intente hacer diff
+*.bin  binary
+*.pt   binary
+*.png  binary
+*.jpg  binary
+*.xlsx binary

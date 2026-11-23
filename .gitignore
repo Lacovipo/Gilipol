@@ -1,0 +1,41 @@
+# ---------------------------------------------------------------
+# Gilipol - ficheros que NO van al repositorio
+# ---------------------------------------------------------------
+
+# Binarios compilados
+*.exe
+*.o
+*.obj
+*.dll
+*.a
+*.su
+*.gcda
+*.gcno
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs de entrenamiento: se regeneran y ocupan mucho
+*.log
+
+# Partidas de prueba
+*.pgn
+
+# Copias de seguridad y temporales
+*.bak
+*.bak_*
+*.tmp
+*~
+*.orig
+*.rej
+
+# Ajustes locales de Claude Code (son de esta maquina, no del proyecto)
+.claude/settings.local.json
+
+# Volcados de FEN para medir el clasificador tactico (millones de lineas,
+# se regeneran desde PostgreSQL)
+fens_*.txt
+VOLCADO*.bin
+desktop.ini

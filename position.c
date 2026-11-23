@@ -15,7 +15,7 @@ uint64_t castle_keys[16];
 uint64_t side_key;
 
 // --- Historial de la Partida (para detección de repeticiones) ---
-uint64_t game_history[1024];
+uint64_t game_history[MAX_GAME_HISTORY];
 int game_history_count = 0;
 
 int is_repetition(const Position* pos)
@@ -47,8 +47,13 @@ int is_repetition(const Position* pos)
         // Validar que game_history_count no exceda el límite
         int max_index = (game_history_count < MAX_GAME_HISTORY) ? game_history_count : MAX_GAME_HISTORY;
 
-        // Comprobamos hacia atrás en el historial global
-        for (int i = max_index - 1; i >= 0; i--)
+        // Comprobamos hacia atrás en el historial global.
+        //
+        // OJO: se empieza en max_index - 2, no en max_index - 1. La última entrada del
+        // historial ES la posición raíz, que el bucle de punteros de arriba ya ha
+        // comprobado. Al no saltarla se comparaba dos veces y, peor, moves_back quedaba
+        // desfasado en uno, así que el barrido paraba una posición antes de lo debido.
+        for (int i = max_index - 2; i >= 0; i--)
         {
             if (moves_back > pos->half_move_clock)
                 break;
@@ -129,40 +134,66 @@ uint64_t compute_hash(const Position* pos)
     return hash;
 }
 
-// Parsea una cadena FEN y rellena la estructura Position
-void parse_fen(Position* pos, const char* fen)
+// Hash sólo de los peones. Es la clave de la correction history: agrupa las
+// posiciones que comparten estructura de peones, que es donde la red tiende a
+// equivocarse de forma parecida.
+uint64_t compute_pawn_hash(const Position* pos)
 {
-    if (fen == NULL)
-        return;
+    uint64_t h = 0;
+    for (int c = 0; c < 2; c++)
+    {
+        Bitboard bb = pos->pieces[c][PAWN];
+        while (bb)
+        {
+            int sq = get_lsb_index(bb);
+            h ^= piece_keys[c][PAWN][sq];
+            POP_BIT(bb, sq);
+        }
+    }
+    return h;
+}
 
-    // Limpiar la posición actual
+// Parsea una cadena FEN y rellena la estructura Position
+// Valida y carga un FEN. Es transaccional: si el FEN no es valido, la posicion de
+// destino NO se toca y devuelve 0. Antes se aceptaba cualquier cosa con un aviso, y un
+// FEN con el rey del bando que no mueve en jaque, sin reyes o con material imposible
+// llevaba a capturar el rey, a desbordar moves[256] o a leer fuera de la cadena (I18,
+// I22). Los enroques sin rey o torre en su casilla y una casilla al paso imposible se
+// corrigen en silencio, como hace Stockfish: si no, make_move se inventaba la torre (I21).
+int parse_fen(Position* destino, const char* fen)
+{
+    if (fen == NULL || destino == NULL)
+        return 0;
+
+    Position tmp;
+    Position* pos = &tmp;
     memset(pos, 0, sizeof(Position));
     pos->en_passant_sq = SQ_NONE;
-    
+    bool ok = true;
+
+    // 1. Colocacion de piezas: 8 filas de 8 casillas
     int rank = 7;
     int file = 0;
-    
-    // 1. Colocación de piezas
-    while ((rank >= 0) && *fen)
+    while (*fen == ' ')
+        fen++;
+    while (*fen && *fen != ' ')
     {
-        int count = 1;
-        if (isdigit(*fen))
+        const char c = *fen++;
+        if (c >= '1' && c <= '8')
         {
-            count = *fen - '0';
-            file += count;
+            file += c - '0';
         }
-        else if (*fen == '/')
+        else if (c == '/')
         {
+            if (file != 8)
+                ok = false;
             rank--;
             file = 0;
         }
         else
         {
             int piece = -1;
-            int color = (isupper(*fen)) ? WHITE : BLACK;
-            char p = tolower(*fen);
-            
-            switch (p)
+            switch (tolower((unsigned char)c))
             {
                 case 'p': piece = PAWN; break;
                 case 'n': piece = KNIGHT; break;
@@ -171,36 +202,46 @@ void parse_fen(Position* pos, const char* fen)
                 case 'q': piece = QUEEN; break;
                 case 'k': piece = KING; break;
             }
-            
-            if (piece != -1)
+            if (piece == -1 || rank < 0 || file > 7)
             {
-                int sq = rank * 8 + file;
-                pos->pieces[color][piece] |= (1ULL << sq);
-                pos->occupied[color] |= (1ULL << sq);
-                pos->all |= (1ULL << sq);
-                file++;
+                ok = false;
+                break;
             }
+            const int color = isupper((unsigned char)c) ? WHITE : BLACK;
+            const Bitboard b = 1ULL << (rank * 8 + file);
+            pos->pieces[color][piece] |= b;
+            pos->occupied[color] |= b;
+            pos->all |= b;
+            file++;
         }
-        fen++;
-        if (*fen == ' ')
-            break; // Fin de la sección de piezas
+        if (file > 8 || rank < 0)
+            ok = false;
     }
-    
-    // Avanzar al siguiente campo
+    if (rank != 0 || file != 8)
+        ok = false;
+
+    // 2. Bando al turno
     while (*fen == ' ')
         fen++;
-    
-    // 2. Color activo
-    pos->side_to_move = (*fen == 'w') ? WHITE : BLACK;
-    fen++;
-    
+    if (*fen == 'w')
+        pos->side_to_move = WHITE;
+    else if (*fen == 'b')
+        pos->side_to_move = BLACK;
+    else
+        ok = false;
+    if (*fen)
+        fen++;
+
     // 3. Derechos de enroque
     while (*fen == ' ')
         fen++;
-    pos->castling_rights = 0;
-    if (*fen != '-')
+    if (*fen == '-')
     {
-        while (*fen != ' ' && *fen != '\0')
+        fen++;
+    }
+    else
+    {
+        while (*fen && *fen != ' ')
         {
             switch (*fen)
             {
@@ -208,67 +249,121 @@ void parse_fen(Position* pos, const char* fen)
                 case 'Q': pos->castling_rights |= WHITE_OOO; break;
                 case 'k': pos->castling_rights |= BLACK_OO; break;
                 case 'q': pos->castling_rights |= BLACK_OOO; break;
+                default: break;
             }
             fen++;
         }
     }
-    else
-        fen++;
-    
-    // 4. Casilla al paso (En passant)
+
+    // 4. Casilla al paso
     while (*fen == ' ')
         fen++;
-    if (*fen != '-')
+    if (*fen == '-')
     {
-        int f = fen[0] - 'a';
-        int r = fen[1] - '1';
-        pos->en_passant_sq = r * 8 + f;
+        fen++;
+    }
+    else if (fen[0] >= 'a' && fen[0] <= 'h' && fen[1] >= '1' && fen[1] <= '8')
+    {
+        pos->en_passant_sq = (fen[1] - '1') * 8 + (fen[0] - 'a');
         fen += 2;
     }
     else
     {
-        pos->en_passant_sq = SQ_NONE;
-        fen++;
+        while (*fen && *fen != ' ')   // campo ilegible: se ignora
+            fen++;
     }
-    
-    // 5. Reloj de 50 movimientos
+
+    // 5 y 6. Relojes (opcionales: un EPD no los trae)
     while (*fen == ' ')
         fen++;
     if (*fen)
         pos->half_move_clock = atoi(fen);
-    
-    // 6. Número de jugada completa
     while (*fen && *fen != ' ')
-        fen++; // Saltar reloj anterior
+        fen++;
     while (*fen == ' ')
         fen++;
     if (*fen)
         pos->full_move_number = atoi(fen);
-    
-    // Calcular hash inicial
+    if (pos->half_move_clock < 0)
+        pos->half_move_clock = 0;
+    if (pos->half_move_clock > 150)           // (200 - hmc) escala la eval: nunca negativo
+        pos->half_move_clock = 150;
+
+    // Material posible: un rey por bando, peones fuera de las filas 1 y 8, y no mas
+    // piezas de las que caben con las coronaciones (si no, moves[256] puede desbordar)
+    if (ok)
+    {
+        for (int c = WHITE; c <= BLACK; c++)
+        {
+            const int peones = count_bits(pos->pieces[c][PAWN]);
+            const int extra = max(0, count_bits(pos->pieces[c][KNIGHT]) - 2)
+                            + max(0, count_bits(pos->pieces[c][BISHOP]) - 2)
+                            + max(0, count_bits(pos->pieces[c][ROOK]) - 2)
+                            + max(0, count_bits(pos->pieces[c][QUEEN]) - 1);
+            if (count_bits(pos->pieces[c][KING]) != 1
+                || peones > 8
+                || extra > 8 - peones
+                || count_bits(pos->occupied[c]) > 16)
+                ok = false;
+        }
+        if ((pos->pieces[WHITE][PAWN] | pos->pieces[BLACK][PAWN]) & 0xFF000000000000FFULL)
+            ok = false;
+    }
+    if (!ok)
+    {
+        printf("info string Error: FEN invalido (formato, reyes o material imposible): no se carga\n");
+        return 0;
+    }
+
+    // Enroques coherentes con el tablero: rey y torre en su casilla (I21)
+    const int enroques_fen = pos->castling_rights;
+    if (!(pos->pieces[WHITE][KING] & (1ULL << SQ_E1)))
+        pos->castling_rights &= ~(WHITE_OO | WHITE_OOO);
+    if (!(pos->pieces[WHITE][ROOK] & (1ULL << SQ_H1)))
+        pos->castling_rights &= ~WHITE_OO;
+    if (!(pos->pieces[WHITE][ROOK] & (1ULL << SQ_A1)))
+        pos->castling_rights &= ~WHITE_OOO;
+    if (!(pos->pieces[BLACK][KING] & (1ULL << SQ_E8)))
+        pos->castling_rights &= ~(BLACK_OO | BLACK_OOO);
+    if (!(pos->pieces[BLACK][ROOK] & (1ULL << SQ_H8)))
+        pos->castling_rights &= ~BLACK_OO;
+    if (!(pos->pieces[BLACK][ROOK] & (1ULL << SQ_A8)))
+        pos->castling_rights &= ~BLACK_OOO;
+    if (pos->castling_rights != enroques_fen)
+        printf("info string Aviso: enroques del FEN sin rey o torre en su casilla; corregidos\n");
+
+    // Casilla al paso posible: en la fila 6 (o 3), vacia, con la casilla de salida del
+    // peon vacia, el peon que acaba de avanzar dos delante, y algun peon que pueda
+    // capturar (si no, sobra y descuadra el hash con el de make_move: I16)
+    if (pos->en_passant_sq != SQ_NONE)
+    {
+        const int ep = pos->en_passant_sq;
+        const int us = pos->side_to_move;
+        const bool fila_ok = (us == WHITE) ? (ep / 8 == 5) : (ep / 8 == 2);
+        const int peon   = (us == WHITE) ? ep - 8 : ep + 8;
+        const int origen = (us == WHITE) ? ep + 8 : ep - 8;
+        if (!fila_ok
+            || !(pos->pieces[us ^ 1][PAWN] & (1ULL << peon))
+            || (pos->all & (1ULL << ep))
+            || (pos->all & (1ULL << origen))
+            || !(get_pawn_attacks(us ^ 1, ep) & pos->pieces[us][PAWN]))
+            pos->en_passant_sq = SQ_NONE;
+    }
+
     pos->hash = compute_hash(pos);
+    pos->pawn_hash = compute_pawn_hash(pos);
 
-    // Validaciones básicas
-    int white_kings = count_bits(pos->pieces[WHITE][KING]);
-    int black_kings = count_bits(pos->pieces[BLACK][KING]);
+    // El bando que NO mueve no puede estar en jaque: la busqueda capturaria el rey (I18)
+    const int enemigo = pos->side_to_move ^ 1;
+    if (is_square_attacked(pos, get_lsb_index(pos->pieces[enemigo][KING]), pos->side_to_move))
+    {
+        printf("info string Error: FEN invalido: el rey del bando que no mueve esta en jaque\n");
+        return 0;
+    }
 
-    if (white_kings != 1 || black_kings != 1)
-        printf("Error: FEN inválido - debe haber exactamente 1 rey por bando (White: %d, Black: %d)\n", white_kings, black_kings);
-
-    // Verificar que no hay peones en rank 1 u 8
-    if (pos->pieces[WHITE][PAWN] & 0xFF000000000000FFULL)
-        printf("Warning: FEN tiene peones blancos en rank 1 u 8\n");
-    if (pos->pieces[BLACK][PAWN] & 0xFF000000000000FFULL)
-        printf("Warning: FEN tiene peones negros en rank 1 u 8\n");
-
-    // Verificar que el rey enemigo no está en jaque
-    int enemy = pos->side_to_move ^ 1;
-    int enemy_king_sq = get_lsb_index(pos->pieces[enemy][KING]);
-    if (enemy_king_sq >= 0 && is_square_attacked(pos, enemy_king_sq, pos->side_to_move))
-        printf("Warning: FEN inválido - el rey del bando que no mueve está en jaque\n");
-
-    // Inicializar acumulador NNUE
     nnue_refresh_accumulator(pos);
+    *destino = tmp;
+    return 1;
 }
 
 // Imprime el tablero en ASCII (útil para debug)
@@ -335,8 +430,14 @@ const int castling_rights_mask[64] =
 // Helper para actualizar acumulador NNUE
 static inline void accum_update(Accumulator* acc, int feature, int sign)
 {
+#if defined(__AVX2__)
+    // Compilado para una CPU concreta: el compilador vectoriza el bucle
     for (int i = 0; i < HIDDEN1; i++)
         acc->values[i] += sign * nnue_weights.W1[feature][i];
+#else
+    // Ejecutable generico: la variante SIMD se elige en tiempo de ejecucion
+    nnue_acumular(acc->values, feature, sign);
+#endif
 }
 
 // Realiza un movimiento en el tablero.
@@ -375,7 +476,7 @@ int make_move(Position* pos, Move move)
 
     if (type == -1)
     {
-        printf("Error: No piece at source sq %d\n", source);
+        printf("info string Error: no hay pieza en la casilla de origen %d\n", source);
         return 0;
     }
 
@@ -391,6 +492,8 @@ int make_move(Position* pos, Move move)
     SET_BIT(pos->all, target);
     pos->hash ^= piece_keys[side][type][source]; // Hash: Quitar pieza origen
     pos->hash ^= piece_keys[side][type][target]; // Hash: Poner pieza destino
+    if (type == PAWN)
+        pos->pawn_hash ^= piece_keys[side][PAWN][source] ^ piece_keys[side][PAWN][target];
     
     // --- Manejo de Capturas ---
     if (GET_MOVE_CAPTURE(move))
@@ -403,6 +506,7 @@ int make_move(Position* pos, Move move)
             POP_BIT(pos->occupied[enemy], ep_pawn_sq);
             POP_BIT(pos->all, ep_pawn_sq);
             pos->hash ^= piece_keys[enemy][PAWN][ep_pawn_sq];
+            pos->pawn_hash ^= piece_keys[enemy][PAWN][ep_pawn_sq];
             
             // --- NNUE: Quitar peón capturado (EP) ---
             accum_update(&pos->accumulator, (enemy * 6 + PAWN) * 64 + ep_pawn_sq, -1);
@@ -417,6 +521,8 @@ int make_move(Position* pos, Move move)
                     POP_BIT(pos->pieces[enemy][p], target);
                     POP_BIT(pos->occupied[enemy], target);
                     pos->hash ^= piece_keys[enemy][p][target];
+                    if (p == PAWN)
+                        pos->pawn_hash ^= piece_keys[enemy][PAWN][target];
                     
                     // --- NNUE: Quitar pieza capturada ---
                     accum_update(&pos->accumulator, (enemy * 6 + p) * 64 + target, -1);
@@ -434,6 +540,7 @@ int make_move(Position* pos, Move move)
         // Poner la pieza promovida
         SET_BIT(pos->pieces[side][promoted], target);
         pos->hash ^= piece_keys[side][PAWN][target];     // Hash: Quitar peón (ya movido)
+        pos->pawn_hash ^= piece_keys[side][PAWN][target];
         pos->hash ^= piece_keys[side][promoted][target]; // Hash: Poner dama/torre/etc
         
         // --- NNUE: Añadir pieza promovida ---
@@ -531,13 +638,16 @@ int make_move(Position* pos, Move move)
     if (pos->en_passant_sq != SQ_NONE)
         pos->hash ^= enpassant_keys[pos->en_passant_sq]; // Hash: Quitar EP viejo
     pos->en_passant_sq = SQ_NONE; // Resetear por defecto
+    // Casilla al paso solo si algun peon rival puede capturar: si no, dos posiciones
+    // identicas tenian hash distinto y se perdian repeticiones (I16)
     if (GET_MOVE_DOUBLE(move))
     {
-        if (side == WHITE)
-            pos->en_passant_sq = target - 8;
-        else
-            pos->en_passant_sq = target + 8;
-        pos->hash ^= enpassant_keys[pos->en_passant_sq]; // Hash: Poner EP nuevo
+        const int ep = (side == WHITE) ? target - 8 : target + 8;
+        if (get_pawn_attacks(side, ep) & pos->pieces[enemy][PAWN])
+        {
+            pos->en_passant_sq = ep;
+            pos->hash ^= enpassant_keys[ep]; // Hash: Poner EP nuevo
+        }
     }
 
     // Actualizar reloj de 50 movimientos
@@ -574,6 +684,13 @@ int make_move(Position* pos, Move move)
 // Se usa para la heurística Null Move Pruning en la búsqueda.
 void make_null_move(Position* pos)
 {
+    // OJO: el movimiento nulo NO incrementa half_move_clock, y es deliberado.
+    //
+    // Lo probe al reves y sale mal por dos motivos: las jugadas REALES del subarbol ya
+    // incrementan el contador ellas solas, asi que sumar uno por cada nulo es contar de
+    // mas; y en el limite, un contador de 99 mas un nulo da 100 y el hijo devuelve tablas
+    // por regla de 50 sin que exista tal empate. Medido: +10 % de nodos en bench.
+
     // Cambiar turno
     pos->side_to_move ^= 1;
     pos->hash ^= side_key;
